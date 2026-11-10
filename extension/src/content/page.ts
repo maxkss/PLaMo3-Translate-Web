@@ -52,28 +52,100 @@ const LOOK = [
 /** units requested at once: the engine decodes up to 3 together, one more waits so a finished row refills at once */
 const MAX_INFLIGHT = 4;
 /**
- * Short sibling units (list items, the cells of a row, menu links, repeated cards — any short units whose elements
- * share a parent) are translated together: one request, one line per unit. The model keeps the line structure
- * (314/314 items on real pages, test/group-probe.mjs), each line is put back into its own unit, and the siblings give
- * each other context ("Terms" in a footer is 약관, not 용어). Units longer than GROUP_ITEM_CHARS keep their own
- * request; a group stays within one model call (GROUP_CHARS) and GROUP_SIZE units.
+ * Units are translated in groups: one request, one line per unit (a unit's text has no line breaks). The model keeps
+ * the line structure (314/314 items on real pages, test/group-probe.mjs), each line is put back into its own unit, and
+ * the units give each other context: a footer's "Terms" is 약관, not 용어, and the items of a list share their terms.
  *
- * Repeated structures group too, when the units are cousins rather than siblings (a story title in each table row,
- * the price in each product card): the nearest ancestor within REPEAT_DEPTH levels that repeats (REPEAT_MIN siblings
- * with its tag and classes) is the item, and units at the same tag/class path inside items of one list share a key.
- * A unit takes whichever of its two groups (siblings, repeated path) has more pending units.
+ * A group is a part of the DOM tree, so what belongs together on the page is translated together (packGroups):
+ * - the largest subtree that fits the budget is one group: a list, a table row, a card, a heading with its paragraph
+ *   (wrappers with a single child do not matter, any element counts);
+ * - small neighbouring subtrees are packed into one group, each of them whole;
+ * - a container larger than the budget is cut at the boundaries of its children, from its start;
+ * - a group never crosses a landmark or widget (HARD), nor a unit that is too long to share a request.
+ * Groups depend on the page only (not on what is on screen or already translated): the reading order decides which
+ * group is sent next, and a group is sent with all its pending units.
+ *
+ * The budget is in source tokens, estimated (unitCost): one group is meant to be one model call (CHUNK_TOKENS in
+ * engine/translator.ts, which packs the lines of a request that is longer after all into as few calls as fit).
  */
-const GROUP_ITEM_CHARS = 120;
-const GROUP_CHARS = 500;
+const GROUP_TOKENS = 340;
 const GROUP_SIZE = 16;
-const REPEAT_DEPTH = 6;
-const REPEAT_MIN = 3;
-/** An element's shape for finding repeated items: its tag and classes, without classes that number or mark one item
- * (item-3, active, selected…). */
-const STATE_CLASS = /\d|^(is-|has-)?(active|selected|current|open|expanded|first|last|odd|even|hover|focus|visited|new|read|unread)$/i;
-export function shape(el: Element): string {
-  const cls = [...el.classList].filter((c) => !STATE_CLASS.test(c)).sort().join(".");
-  return cls ? `${el.tagName}.${cls}` : el.tagName;
+/** test hook: <html data-plamo-group-tokens="N"> overrides GROUP_TOKENS (for comparisons) */
+const groupTokens = () => {
+  const v = Number(document.documentElement.dataset.plamoGroupTokens);
+  return Number.isFinite(v) && v > 0 ? v : GROUP_TOKENS;
+};
+/** landmarks and widgets: a group never crosses their boundary, however small they are */
+const HARD = [
+  "header", "nav", "main", "aside", "footer", "form", "dialog",
+  ...["banner", "navigation", "main", "complementary", "contentinfo", "search", "form", "dialog", "alertdialog",
+    "menu", "menubar", "tablist", "toolbar", "tree", "listbox"].map((r) => `[role=${r}]`),
+].join(", ");
+
+/**
+ * Source tokens of a unit, estimated from its characters (the tokenizer is not in the page). Measured with the PLaMo
+ * tokenizer: English text ~0.15–0.2 tokens a letter, digits ~1 and punctuation ~0.5, kana ~0.5, kanji ~0.9, Hangul
+ * more than 1 (bytes), a numbered tag ~4. An estimate that is too low costs a second model call for the group, one
+ * that is too high a smaller group.
+ */
+export function unitCost(source: string): number {
+  let n = 1; // its line break
+  const text = source.replace(/<\/?[a-z]+\d+\s*\/?>/gi, () => ((n += 4), ""));
+  for (const ch of text) {
+    const c = ch.codePointAt(0)!;
+    if (c < 0x80) n += c >= 0x30 && c <= 0x39 ? 1 : c === 0x20 || (c | 0x20) >= 0x61 && (c | 0x20) <= 0x7a ? 0.18 : 0.5;
+    else if (c >= 0x3040 && c <= 0x30ff) n += 0.5; // kana
+    else if (c >= 0xac00 && c <= 0xd7af) n += 1.3; // Hangul
+    else if (c >= 0x2e80 && c <= 0x9fff) n += 0.9; // CJK ideographs and punctuation
+    else n += 0.5;
+  }
+  return n;
+}
+
+/** A node of the tree that groups are cut from: a unit (`item`) or an element with the nodes inside it. */
+export interface PackNode<T> {
+  item?: T;
+  cost?: number;
+  /** nothing inside is grouped with anything outside */
+  hard?: boolean;
+  children?: PackNode<T>[];
+}
+
+/**
+ * Cut the tree into groups, in document order: a subtree that fits (`budget` in cost, `max` items) stays whole and is
+ * packed with the fitting subtrees next to it; one that does not fit is cut at its children; an item above the budget
+ * is a group of its own. Nothing is packed across a subtree that was cut, or across a `hard` node.
+ */
+export function packGroups<T>(root: PackNode<T>, budget: number, max: number): T[][] {
+  // the items of `n` for its parent to pack with its neighbours, or the groups `n` was cut into
+  const walk = (n: PackNode<T>): { items: T[]; cost: number; groups?: undefined } | { groups: T[][] } => {
+    if (n.item !== undefined) return { items: [n.item], cost: n.cost ?? 0 };
+    const groups: T[][] = [];
+    let buf: T[] = [], cost = 0, cut = false;
+    const flush = () => {
+      if (buf.length) groups.push(buf);
+      buf = [];
+      cost = 0;
+      cut = true;
+    };
+    for (const c of n.children ?? []) {
+      const sub = walk(c);
+      if (sub.groups) {
+        flush();
+        groups.push(...sub.groups);
+        continue;
+      }
+      if (buf.length + sub.items.length > max || cost + sub.cost > budget) flush();
+      buf.push(...sub.items);
+      cost += sub.cost;
+      if (cost > budget) flush(); // a single item above the budget
+    }
+    if (!cut && !n.hard) return { items: buf, cost };
+    flush();
+    return { groups };
+  };
+  const all = walk(root);
+  return all.groups ?? (all.items.length ? [all.items] : []);
 }
 /** verbatim content longer than this is sent as a placeholder only */
 const VERBATIM_MAX = 80;
@@ -123,11 +195,13 @@ interface Unit {
   order: number;
   translation?: string;
   reqId?: string;
-  /** units with the same key may be translated together (the parent of the unit's element); null: always alone */
-  groupKey: Node | null;
-  /** units at the same path inside repeated items of one list (see REPEAT_DEPTH) share this key; null: none */
-  repeatKey: string | null;
-  /** its group's output did not split back into lines: translate it alone */
+  /** source tokens, estimated (unitCost) */
+  cost: number;
+  /** the units it is translated with (packGroups), itself included; set by regroup() */
+  group?: Unit[];
+  /** its group's output did not split back into lines: the half of that group it is sent with once more */
+  retry?: Unit[];
+  /** the retry did not split back into lines either: translate it alone */
   solo?: boolean;
   /** the group request it is part of, while running */
   batch?: Batch;
@@ -337,9 +411,8 @@ export class PageTranslator {
   private byText = new WeakMap<Text, Unit>();
   /** element whose children a unit's run (or a tagged element's content) consists of → that unit */
   private byParent = new WeakMap<Node, Unit>();
-  /** numbers the lists of repeated items (repeatKey) */
-  private listIds = new WeakMap<Element, number>();
-  private nextListId = 1;
+  /** units were added or dropped since the groups were made */
+  private groupsStale = true;
   /** nodes we created (text nodes in replace mode); never scanned */
   private ours = new WeakSet<Node>();
   private blockCache = new WeakMap<Element, boolean>();
@@ -665,8 +738,7 @@ export class PageTranslator {
       main: !!outer.closest(MAIN_SELECTOR),
       state: "pending",
       order: this.order++,
-      groupKey: null,
-      repeatKey: null,
+      cost: 0,
       writes: new Map(),
       created: [],
     };
@@ -693,11 +765,9 @@ export class PageTranslator {
     for (const p of levelParents(u.level)) this.byParent.set(p, u);
     if (!u.texts.some((t) => t.data.trim())) return; // nothing of ours to track (e.g. only an image)
     if (u.text.length < 2 || !HAS_LETTER.test(u.text) || alreadyInTarget(u.text, this.target, document.documentElement.lang)) u.state = "skipped";
-    if (u.source.length <= GROUP_ITEM_CHARS) {
-      u.groupKey = outer.parentElement;
-      u.repeatKey = this.repeatKey(outer);
-    }
+    u.cost = unitCost(u.source);
     this.units.push(u);
+    this.groupsStale = true;
     this.mark(u);
   }
 
@@ -706,7 +776,11 @@ export class PageTranslator {
     if (DEBUG() && u.level.parent.nodeType === Node.ELEMENT_NODE) {
       const el = u.level.parent as HTMLElement;
       el.dataset.plamoState = u.state;
+      if (u.hidden) el.dataset.plamoHidden = "";
       if (u.batch) el.dataset.plamoBatch = u.batch.id;
+      else if (u.state === "running") delete el.dataset.plamoBatch; // sent alone (after its group failed)
+      if (u.retry) el.dataset.plamoRetry = "";
+      if (u.solo) el.dataset.plamoSolo = "";
       el.dataset.plamoSrc = u.source.slice(0, 600);
       if (u.translation) el.dataset.plamoTr = u.translation.slice(0, 600);
     }
@@ -834,6 +908,7 @@ export class PageTranslator {
     this.toPaint.delete(u);
     const i = this.units.indexOf(u);
     if (i >= 0) this.units.splice(i, 1);
+    this.groupsStale = true;
   }
 
   // ------------------------------------------------------------ scheduling
@@ -872,50 +947,51 @@ export class PageTranslator {
   }
 
   /**
-   * The key of `el`'s place in a repeated structure: the nearest ancestor (below <body>, within REPEAT_DEPTH levels
-   * above `el`) that has at least REPEAT_MIN siblings of its own shape, plus the shape path from it down to `el`.
-   * `el` itself repeating is the sibling case and does not count.
+   * Make the groups (packGroups) from all units that are translated, whatever their state, so that a group does not
+   * depend on what happens to be pending: the tree of the elements around the units, in document order.
    */
-  private repeatKey(el: HTMLElement): string | null {
-    let path = shape(el);
-    let a = el.parentElement;
-    for (let d = 0; d < REPEAT_DEPTH && a && a.parentElement && a !== document.body; d++, a = a.parentElement) {
-      const sig = shape(a);
-      let same = 0;
-      for (const c of a.parentElement.children) if (shape(c) === sig && ++same >= REPEAT_MIN) break;
-      if (same >= REPEAT_MIN) {
-        let id = this.listIds.get(a.parentElement);
-        if (id == null) this.listIds.set(a.parentElement, (id = this.nextListId++));
-        return `${id}/${sig}/${path}`;
+  private regroup(): void {
+    this.groupsStale = false;
+    const debug = DEBUG();
+    // hidden labels (icon buttons) are grouped among themselves: they are not part of the visible text around them
+    for (const hidden of [false, true]) {
+      const anchor = (u: Unit): Node => u.texts.find((t) => t.isConnected) ?? u.outer;
+      const units = this.units
+        .filter((u) => u.state !== "skipped" && u.hidden === hidden)
+        .map((u) => ({ u, at: anchor(u) }))
+        .sort((a, b) => (a.at === b.at ? 0 : a.at.compareDocumentPosition(b.at) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1));
+      const root: PackNode<Unit> = { hard: true, children: [] };
+      const nodes = new Map<Element, PackNode<Unit>>([[document.body, root]]);
+      const nodeOf = (el: Element | null): PackNode<Unit> => {
+        if (!el) return root;
+        let n = nodes.get(el);
+        if (!n) {
+          nodes.set(el, (n = { hard: el.matches(HARD), children: [] }));
+          nodeOf(el.parentElement).children!.push(n);
+        }
+        return n;
+      };
+      for (const { u } of units) nodeOf(u.outer).children!.push({ item: u, cost: u.cost });
+      for (const group of packGroups(root, groupTokens(), GROUP_SIZE)) {
+        for (const u of group) {
+          u.group = group;
+          if (debug && u.level.parent.nodeType === Node.ELEMENT_NODE) (u.level.parent as HTMLElement).dataset.plamoGroup = String(group[0].order);
+        }
       }
-      path = `${sig}>${path}`;
     }
-    return null;
   }
 
   /**
-   * The pending units to translate with `u`, in document order: consecutive units around it that share its sibling
-   * key or its repeated-structure key (whichever has more pending units), up to GROUP_SIZE units and GROUP_CHARS of
-   * source.
+   * The pending units to translate with `u`: those of its group — after a group's lines did not come back one per
+   * unit, those of the half it is tried again with, and after that, itself.
    */
   private groupFor(u: Unit): Unit[] {
     // <html data-plamo-nogroup>: one request per unit (for comparisons)
     if (u.solo || document.documentElement.hasAttribute("data-plamo-nogroup")) return [u];
-    const ok = (v: Unit) => !v.solo && v.hidden === u.hidden && (v.state === "pending" || v === u);
-    const sibs = u.groupKey ? this.units.filter((v) => v.groupKey === u.groupKey && ok(v)) : [u];
-    const cousins = u.repeatKey ? this.units.filter((v) => v.repeatKey === u.repeatKey && ok(v)) : [u];
-    const pool = (cousins.length > sibs.length ? cousins : sibs).sort((a, b) => a.order - b.order);
-    const at = pool.indexOf(u);
-    let lo = at, hi = at, chars = u.source.length;
-    const fits = (v: Unit) => hi - lo + 1 < GROUP_SIZE && chars + v.source.length + 1 <= GROUP_CHARS;
-    for (;;) {
-      if (hi + 1 < pool.length && fits(pool[hi + 1])) chars += pool[++hi].source.length + 1;
-      else if (lo > 0 && fits(pool[lo - 1])) chars += pool[--lo].source.length + 1;
-      else break;
-    }
-    return pool.slice(lo, hi + 1);
+    if (this.groupsStale) this.regroup();
+    const live = new Set(this.units);
+    return (u.retry ?? u.group ?? [u]).filter((v) => v === u || (v.state === "pending" && !v.solo && !!v.retry === !!u.retry && live.has(v)));
   }
-
 
   /** Translate several units in one request, one line each; when the lines do not come back one per unit, each is
    * queued again on its own. */
@@ -944,16 +1020,29 @@ export class PageTranslator {
       .then(
         (tr) => {
           const out = tr.split(/\n+/).map((l) => l.trim()).filter(Boolean);
-          units.forEach((u, i) => {
-            if (!live(u)) return;
-            u.batch = undefined;
-            if (out.length !== units.length) {
-              // the model merged or split lines: no reliable way to tell which part is whose
+          const rest = units.filter(live);
+          for (const u of rest) u.batch = undefined;
+          if (out.length !== units.length) {
+            // the model merged or split lines: no reliable way to tell which part is whose. Once more in two halves
+            // (the lines that went wrong are in one of them), then each unit alone.
+            const again = rest.length >= 4 && !rest.some((u) => u.retry);
+            const half = Math.ceil(rest.length / 2);
+            const halves = [rest.slice(0, half), rest.slice(half)];
+            rest.forEach((u, i) => {
               u.state = "pending";
-              u.solo = true;
+              if (again) u.retry = halves[i < half ? 0 : 1];
+              else u.solo = true;
+              if (DEBUG() && u.level.parent.nodeType === Node.ELEMENT_NODE) {
+                const el = u.level.parent as HTMLElement;
+                el.dataset.plamoGroupIn = lines.join("\n").slice(0, 3000);
+                el.dataset.plamoGroupOut = tr.slice(0, 3000);
+              }
               this.mark(u);
-              return;
-            }
+            });
+            return;
+          }
+          units.forEach((u, i) => {
+            if (!rest.includes(u)) return;
             u.state = "done";
             u.translation = unshiftTags(out[i], offsets[i], u.slots.size);
             this.mark(u);

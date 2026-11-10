@@ -1,7 +1,7 @@
 /** Group requests in page translation: tag numbers shifted into one request and back (content/page.ts). */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { shape, shiftTags, unshiftTags } from "../src/content/page.ts";
+import { packGroups, shiftTags, unitCost, unshiftTags, type PackNode } from "../src/content/page.ts";
 
 test("shiftTags moves every numbered tag, opening, closing and self-closing", () => {
   assert.equal(shiftTags("<a1>Home</a1> <x2/> <b3>new</b3>", 4), "<a5>Home</a5> <x6/> <b7>new</b7>");
@@ -28,10 +28,48 @@ test("a round trip through a group keeps each unit's source", () => {
   assert.deepEqual(back, sources);
 });
 
-test("shape ignores classes that number or mark one item", () => {
-  const el = (tag: string, cls: string) => ({ tagName: tag, classList: cls.split(" ").filter(Boolean) }) as unknown as Element;
-  assert.equal(shape(el("TR", "athing submission")), "TR.athing.submission");
-  assert.equal(shape(el("LI", "card card-3 is-active")), shape(el("LI", "card card-7")));
-  assert.equal(shape(el("DIV", "")), "DIV");
-  assert.notEqual(shape(el("DIV", "price")), shape(el("DIV", "title")));
+// a tree in short: a number is a unit of that cost, an array an element, { hard: [...] } a landmark
+type T = number | T[] | { hard: T[] };
+let ids = 0;
+const node = (t: T): PackNode<string> =>
+  typeof t === "number" ? { item: `u${++ids}`, cost: t } : Array.isArray(t) ? { children: t.map(node) } : { hard: true, children: t.hard.map(node) };
+const groups = (t: T, budget = 100, max = 16) => ((ids = 0), packGroups({ hard: true, children: [node(t)] }, budget, max).map((g) => g.join(" ")));
+
+test("a container that fits is one group, with the small containers next to it", () => {
+  // <ul><li>×3</ul>
+  assert.deepEqual(groups([10, 10, 10]), ["u1 u2 u3"]);
+  // heading, paragraph, short list, paragraph
+  assert.deepEqual(groups([5, 30, [10, 10, 10], 20]), ["u1 u2 u3 u4 u5 u6"]);
+  // cards in column wrappers (div.col > div.card > title + price), rows of a table
+  assert.deepEqual(groups([[[10, 5]], [[10, 5]], [[10, 5]]]), ["u1 u2 u3 u4 u5 u6"]);
+});
+
+test("a container above the budget is cut at its children, from its start, each fitting child whole", () => {
+  // six cards of 40: two fit a group, a card is never cut
+  assert.deepEqual(groups([[30, 10], [30, 10], [30, 10], [30, 10], [30, 10]]), ["u1 u2 u3 u4", "u5 u6 u7 u8", "u9 u10"]);
+  // a long list: by count
+  assert.deepEqual(groups([1, 1, 1, 1, 1], 100, 2), ["u1 u2", "u3 u4", "u5"]);
+  // a list that fits stays whole when the text around it does not fit with it: paragraphs | list | paragraph
+  assert.deepEqual(groups([40, 40, [20, 20, 20], 50]), ["u1 u2", "u3 u4 u5", "u6"]);
+  // and it takes the short text after it along
+  assert.deepEqual(groups([40, 40, [20, 20, 20], 40]), ["u1 u2", "u3 u4 u5 u6"]);
+});
+
+test("nothing is packed across a container that was cut, a unit above the budget, or a landmark", () => {
+  // the tail of a cut list does not join the paragraph after it
+  assert.deepEqual(groups([[60, 60, 10], 10]), ["u1", "u2 u3", "u4"]);
+  // a long paragraph between two short ones
+  assert.deepEqual(groups([10, 500, 10]), ["u1", "u2", "u3"]);
+  // a small nav next to a small article
+  assert.deepEqual(groups([{ hard: [5, 5] }, [10, 10]]), ["u1 u2", "u3 u4"]);
+  assert.deepEqual(groups([10, { hard: [5, 5] }, 10]), ["u1", "u2 u3", "u4"]);
+});
+
+test("unitCost follows the tokenizer roughly: Latin is cheap, CJK and tags are not", () => {
+  const en = unitCost("The WebGPU API enables web developers to use the underlying system's GPU.");
+  const ja = unitCost("WebGPUは、ウェブブラウザ上でGPUを利用した高性能な計算を可能にするAPIである。");
+  assert.ok(en > 10 && en < 25, String(en));
+  assert.ok(ja > 15 && ja < 35, String(ja));
+  assert.ok(Math.abs(unitCost("<a1>Home</a1>") - (1 + 8 + 4 * 0.18)) < 1e-9);
+  assert.ok(unitCost("2026-11-10 12:34:56") > unitCost("abcdefghij klmnopqr"));
 });

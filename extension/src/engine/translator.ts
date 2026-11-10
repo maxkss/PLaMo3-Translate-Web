@@ -157,13 +157,13 @@ export class Translator {
   }
 
   /**
-   * Split into model-sized chunks, keeping separators (newlines) verbatim. Numbered inline tags (`<a1>…</a1>`, see
+   * Split into model-sized chunks, keeping the separators between them (newlines) verbatim. Numbered inline tags (`<a1>…</a1>`, see
    * content/page.ts) are never cut apart: chunks are merged until every tag opened in a chunk is closed in it.
    */
   split(text: string): { text: string; translate: boolean; tokens?: number }[] {
     const whole = this.tok.encode(text).length;
     if (whole <= CHUNK_TOKENS) return [{ text, translate: true, tokens: whole }];
-    const pieces = this.splitPlain(text);
+    const pieces = this.packLines(this.splitPlain(text));
     const out: { text: string; translate: boolean; tokens?: number }[] = [];
     let open: string[] = [];
     for (const p of pieces) {
@@ -175,6 +175,25 @@ export class Translator {
       open = openTags(out[out.length - 1].text);
     }
     return out;
+  }
+
+  /**
+   * Lines that follow each other (one line break between them: the items of a list, the units of a page group, see
+   * content/page.ts) go into as few chunks as they fit, so they are translated with each other as context. Blank
+   * lines (paragraphs) still separate chunks.
+   */
+  private packLines(pieces: { text: string; translate: boolean }[]): { text: string; translate: boolean }[] {
+    const out: { text: string; translate: boolean; n?: number }[] = [];
+    for (const p of pieces) {
+      const sep = out[out.length - 1], prev = out[out.length - 2];
+      const n = p.translate ? this.tok.encode(p.text).length : 0;
+      if (p.translate && prev?.translate && sep.text === "\n" && prev.n! + 1 + n <= CHUNK_TOKENS) {
+        out.pop();
+        prev.text += "\n" + p.text;
+        prev.n! += 1 + n;
+      } else out.push({ ...p, n });
+    }
+    return out.map(({ text, translate }) => ({ text, translate }));
   }
 
   private splitPlain(text: string): { text: string; translate: boolean; tokens?: number }[] {
