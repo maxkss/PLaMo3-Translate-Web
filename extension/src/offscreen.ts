@@ -111,6 +111,7 @@ worker.onmessage = (ev: MessageEvent<WorkerOut>) => {
       setStatus({ state: "ready", model: m.model, backend: m.backend, tokensPerSec: undefined, message: `준비됨 (${MODELS[m.model].label} · ${m.backend}, ${(m.ms / 1000).toFixed(1)}s)` });
       loading?.resolve();
       loading = null;
+      void armIdle();
       break;
     case "load-error":
       if (m.gen !== loadGen) break;
@@ -251,6 +252,7 @@ function preemptIfNeeded(): void {
 }
 
 function enqueue(req: TranslateRequest, port: chrome.runtime.Port): void {
+  clearIdle();
   const key = cacheKey(req);
   const hit = cache.get(key);
   if (hit !== undefined) {
@@ -337,6 +339,7 @@ async function runJob(job: Job): Promise<void> {
   }
   if (queue.length === 0 || queue.length % 8 === 0) setStatus({});
   void pump();
+  void armIdle();
 }
 
 // ---------------------------------------------------------------- image OCR
@@ -396,6 +399,17 @@ async function readImage(req: OcrRequest): Promise<ImageBitmap> {
 }
 
 async function handleOcr(req: OcrRequest, port: chrome.runtime.Port): Promise<void> {
+  clearIdle();
+  ocrActive++;
+  try {
+    await runOcr(req, port);
+  } finally {
+    ocrActive--;
+    void armIdle();
+  }
+}
+
+async function runOcr(req: OcrRequest, port: chrome.runtime.Port): Promise<void> {
   const ocrModel = req.ocrModel ?? (await getSettings()).ocrModel ?? "mobile";
   const key = req.src && !req.dataUrl ? `${req.src}\u0001${req.targetLang}\u0001${ocrModel}` : null;
   const hit = key ? ocrCache.get(key) : undefined;
@@ -430,6 +444,33 @@ async function handleOcr(req: OcrRequest, port: chrome.runtime.Port): Promise<vo
   } catch (e) {
     safePost(port, { type: "error", id: req.id, message: String((e as Error)?.message ?? e) });
   }
+}
+
+// ---------------------------------------------------------------- unload when idle
+
+let idleTimer: ReturnType<typeof setTimeout> | null = null;
+let ocrActive = 0;
+const busy = () => running.size > 0 || queue.length > 0 || ocrActive > 0 || !!loading;
+
+function clearIdle(): void {
+  if (idleTimer) clearTimeout(idleTimer);
+  idleTimer = null;
+}
+
+/** (Re)start the countdown after which an idle engine frees its models (Settings.idleUnloadMin; 0 = never). */
+async function armIdle(): Promise<void> {
+  clearIdle();
+  if (busy() || (!loaded && !ocrWorker)) return;
+  const { idleUnloadMin } = await getSettings();
+  if (!idleUnloadMin || busy()) return;
+  clearIdle();
+  idleTimer = setTimeout(() => {
+    idleTimer = null;
+    if (busy()) return;
+    if (loaded) void unload();
+    ocrWorker?.terminate();
+    ocrWorker = null;
+  }, idleUnloadMin * 60_000);
 }
 
 // ---------------------------------------------------------------- ports
@@ -502,6 +543,9 @@ chrome.runtime.onConnect.addListener((port) => {
         break;
       case "unload":
         await unload();
+        break;
+      case "idle-changed":
+        void armIdle();
         break;
       case "delete-model":
         if (activeModel === msg.model || loading) await unload();

@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "PLaMo Translate (On-device)",
   "short_name": "PLaMo Translate",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "PLaMo 3 Translate(0.8B·2B)를 브라우저에서 직접 실행해 선택 영역과 웹페이지 전체를 번역합니다. Built with PLaMo.",
   "minimum_chrome_version": "121",
   "permissions": ["offscreen", "storage", "unlimitedStorage", "contextMenus", "scripting", "activeTab"],

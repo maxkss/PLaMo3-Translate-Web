@@ -78,3 +78,30 @@ export function togglePage(sw, url) {
     return chrome.tabs.sendMessage(tab.id, { type: "page-toggle" });
   }, url);
 }
+
+/**
+ * Translate `text` through the engine port from an extension page (the options page): returns "<translation> | <seconds>s".
+ * Errors come back as "오류: <message>" so callers can log them like a result.
+ */
+export function translateIn(page, text, targetLang) {
+  return page.evaluate(
+    async ({ text, targetLang }) => {
+      const t0 = performance.now();
+      const res = await chrome.runtime.sendMessage({ type: "ensure-engine" });
+      if (!res?.ok) return `오류: ${res?.error ?? "engine"}`;
+      const port = chrome.runtime.connect({ name: "plamo-engine" });
+      const id = `e2e-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const out = await new Promise((resolve) => {
+        port.onMessage.addListener((m) => {
+          if (m.id !== id) return;
+          if (m.type === "done") resolve(m.text);
+          else if (m.type === "error") resolve(`오류: ${m.message}`);
+        });
+        port.postMessage({ type: "translate", id, text, targetLang, priority: 0, stream: false });
+      });
+      port.disconnect();
+      return `${out} | ${((performance.now() - t0) / 1000).toFixed(2)}s`;
+    },
+    { text, targetLang },
+  );
+}

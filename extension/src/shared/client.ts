@@ -151,9 +151,9 @@ export function statusText(s: EngineStatus | null): string {
     case "loading":
       return `${s.model ? `${MODELS[s.model].label} ` : ""}모델 불러오는 중…${pct}`;
     case "idle":
-      return "대기 중 (첫 번역 시 모델을 불러옵니다)";
+      return "대기 중";
     case "ready":
-      return `준비됨 · ${s.model ? `${MODELS[s.model].label} · ` : ""}${s.backend}${s.tokensPerSec ? ` · ${s.tokensPerSec} tok/s` : ""}`;
+      return `준비됨 · ${s.model ? `${MODELS[s.model].label} · ` : ""}${s.backend === "webgpu" ? "WebGPU" : s.backend === "wasm" ? "CPU" : s.backend}`;
     case "error":
       return `오류: ${s.message ?? ""}`;
   }

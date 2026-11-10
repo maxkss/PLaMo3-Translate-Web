@@ -10,7 +10,7 @@ mkdirSync(`${out}/ort`, { recursive: true });
 // static files
 cpSync("src/manifest.json", `${out}/manifest.json`);
 cpSync("src/offscreen.html", `${out}/offscreen.html`);
-for (const f of ["popup.html", "options.html", "pages.css"]) cpSync(`src/pages/${f}`, `${out}/${f}`);
+for (const f of ["popup.html", "options.html"]) cpSync(`src/pages/${f}`, `${out}/${f}`);
 cpSync("public", out, { recursive: true });
 // onnxruntime-web WebGPU build (asyncify) runtime files
 for (const f of ["ort-wasm-simd-threaded.asyncify.wasm", "ort-wasm-simd-threaded.asyncify.mjs"]) {
@@ -47,8 +47,10 @@ const builds = [
   { entryPoints: { background: "src/background.ts" }, format: "esm" },
   { entryPoints: { offscreen: "src/offscreen.ts", "engine-worker": "src/engine/worker.ts", "ocr-worker": "src/ocr/worker.ts" }, format: "esm" },
   { entryPoints: { popup: "src/pages/popup.ts", options: "src/pages/options.ts" }, format: "esm" },
-  // content scripts are classic scripts
-  { entryPoints: { content: "src/content/content.ts" }, format: "iife" },
+  // content scripts are classic scripts; the shared stylesheets are inlined as text into the shadow-DOM UI
+  { entryPoints: { content: "src/content/content.ts" }, format: "iife", loader: { ".css": "text" } },
+  // the extension pages' stylesheet: tokens + components + page styles in one file
+  { entryPoints: { pages: "src/pages/pages.css" }, sourcemap: false, target: "chrome123" },
 ];
 // dev-only latency benchmark pages (BENCH=1 npm run build); src/dev is local-only and not in the repository
 if (process.env.BENCH && existsSync("src/dev")) {

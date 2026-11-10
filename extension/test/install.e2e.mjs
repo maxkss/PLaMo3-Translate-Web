@@ -8,7 +8,7 @@
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { chromium } from "playwright";
-import { profileDir } from "./lib.mjs";
+import { profileDir, translateIn } from "./lib.mjs";
 
 const headed = process.argv.includes("--headed");
 const dist = resolve("dist");
@@ -25,14 +25,7 @@ const ctx = await chromium.launchPersistentContext(profileDir("plamo-install-"),
 const status = (p) => p.textContent("#status");
 const progress = (p) => p.evaluate(() => parseFloat(document.querySelector("#bar > i").style.width) || 0);
 
-async function translate(p, text, lang) {
-  await p.fill("#src", text);
-  await p.selectOption("#lang", lang);
-  await p.evaluate(() => (document.getElementById("speed").textContent = ""));
-  await p.click("#go");
-  await p.waitForFunction(() => document.getElementById("speed").textContent || /오류/.test(document.getElementById("out").textContent), null, { timeout: 120_000 });
-  return `${await p.textContent("#out")} | ${await p.textContent("#speed")}`;
-}
+const translate = (p, text, lang) => translateIn(p, text, lang);
 
 async function waitReady(p) {
   await p.waitForFunction(() => /준비됨|오류|실패/.test(document.getElementById("status").textContent), null, { timeout: 1_200_000, polling: 500 });
@@ -60,7 +53,7 @@ try {
   // ---- 0.8B: start, cancel half-way, resume
   await p.check('input[name="model"][value="0.8b"]');
   await p.waitForFunction(() => /0\.8B/.test(document.getElementById("download").textContent));
-  log("download button:", await p.textContent("#download"), "|", await p.textContent("#source"));
+  log("download button:", await p.textContent("#download"));
   const tStart = performance.now() / 1000;
   await p.click("#download");
   await p.waitForFunction(() => parseFloat(document.querySelector("#bar > i").style.width) > 40, null, { timeout: 600_000, polling: 200 });
@@ -87,9 +80,9 @@ try {
   log("[2B ko]", await translate(p, "PLaMo 3 Translate runs entirely in your browser, so the pages you read never leave your device.", "ko"));
 
   // ---- back to 0.8B (installed): next job loads it
-  const badges = await p.$$eval("[data-badge]", (els) => els.map((e) => e.textContent));
-  check(badges.every((b) => b === "설치됨"), `both models marked installed (${badges.join(", ")})`);
+  check(/설치됨/.test(await p.textContent("#modelInfo")), `2B marked installed (${await p.textContent("#modelInfo")})`);
   await p.check('input[name="model"][value="0.8b"]');
+  check(/설치됨/.test(await p.textContent("#modelInfo")), `0.8B marked installed (${await p.textContent("#modelInfo")})`);
   log("[0.8B again]", await translate(p, "Switching models should not require downloading again.", "ko"));
   const s = await status(p);
   check(/0\.8B/.test(s), `engine now runs 0.8B (${s})`);

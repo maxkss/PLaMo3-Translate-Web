@@ -1,0 +1,58 @@
+/*
+ * Design tokens after the Astryx neutral theme (https://github.com/meta/astryx), shared by every surface:
+ * the extension pages (bundled into pages.css) and the in-page shadow-DOM UI (inlined into content.js).
+ * Colours use light-dark(), so whatever applies them needs `color-scheme: light dark`.
+ *
+ * Every surface paints the same background, --bg (the selection popup's): popup, options page, selection panel,
+ * page-progress toast, image badge and selection button.
+ */
+:root, :host {
+  --font: system-ui, -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", "Segoe UI", Roboto, sans-serif;
+
+  /* surfaces */
+  --bg: light-dark(#ffffff, #1b1b1b);
+  /* cards inside a surface are darker than it, as in Astryx (surface #fff/#262626 over muted #f1f1f1/#1b1b1b);
+     our surface is the darker #1b1b1b in dark mode, so the cards step down to #111111 */
+  --bg-muted: light-dark(#f1f1f1, #111111);
+  --neutral: light-dark(#0000000f, #ffffff1a);
+  --hover: light-dark(#0000000d, #ffffff0d);
+  --pressed: light-dark(#0000001a, #ffffff1a);
+  --tint: light-dark(#000000, #ffffff);
+  --skeleton: light-dark(#f1f1f1, #525252);
+
+  /* accent */
+  --accent: light-dark(#1b1b1b, #f1f1f1);
+  --accent-muted: light-dark(#d4d4d4, #474747);
+  --on-accent: light-dark(#ffffff, #111111);
+
+  /* text, icons, lines */
+  --text: light-dark(#000000, #ffffff);
+  --text-2: light-dark(#474747, #9e9e9e);
+  --text-disabled: light-dark(#919191, #525252);
+  --icon-2: light-dark(#6a6a6a, #9e9e9e);
+  --border: light-dark(#00000014, #ffffff1a);
+  --border-strong: light-dark(#d4d4d4, #525252);
+  --track: light-dark(#ccd3db, #5a5e66);
+
+  /* status */
+  --success: light-dark(#198100, #64af4c);
+  --warning: #ffce2f;
+  --error: light-dark(#c9303a, #ff705d);
+  --info-muted: light-dark(#b9d7ff, #88bcff3d);
+  --on-info-muted: light-dark(#003978, #a1caff);
+  --warning-muted: light-dark(#fae19e, #e2b6233d);
+  --on-warning-muted: light-dark(#4b3900, #eec448);
+  --error-muted: light-dark(#ffc4be, #ff98903d);
+  --on-error-muted: light-dark(#76000c, #ffaea7);
+
+  /* shape */
+  --r-inner: 6px;
+  --r-element: 10px;
+  --r-container: 12px;
+  /* floating surfaces (selection panel, toast, image badge, selection button) all use the high elevation */
+  --shadow-float: 0 4px 6px light-dark(#0000001a, #00000080), 0 12px 24px light-dark(#00000026, #000000b3), inset 0 0 0 1px light-dark(transparent, #ffffff26);
+
+  /* motion */
+  --ease: cubic-bezier(.24, 1, .4, 1);
+  --fast: 125ms;
+}

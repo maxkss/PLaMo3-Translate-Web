@@ -44,7 +44,7 @@ The published weights can be reproduced from the original PFN models. This needs
 tools/convert/convert.sh 0.8b   # or 2b
 ```
 
-The result is `models/onnx/plamo-3-translate-<size>/onnx/model_q4f16.onnx` and `model_q4f16.onnx_data`. To install a local conversion, serve it with `npm run serve-model` in `extension/` and enter the URL under the advanced settings on the options page, or import the folder there. Local files must match the checksums in `extension/src/shared/common.ts`.
+The result is `models/onnx/plamo-3-translate-<size>/onnx/model_q4f16.onnx` and `model_q4f16.onnx_data`. To install a local conversion, serve it with `npm run serve-model` in `extension/`, then point the extension at it from the options page's DevTools console: `chrome.storage.local.set({ modelUrlOverride: "http://localhost:8787/plamo-3-translate-<size>/" })`. Local files must match the checksums in `extension/src/shared/common.ts`.
 
 ## License
 

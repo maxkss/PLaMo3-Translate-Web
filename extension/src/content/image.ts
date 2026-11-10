@@ -13,7 +13,8 @@ import type { ErasePatch, OcrParagraph, OcrResult } from "../shared/common.ts";
 import { FitGroup, fontMetrics, ParaView, type FontMetrics } from "./image-view.ts";
 import { axes, inferLayout } from "./layout.ts";
 import { skipParagraph } from "../shared/skip.ts";
-import { TRANSLATE_ICON } from "./ui.ts";
+import { icon } from "../shared/icons.ts";
+import { SPINNER } from "./ui.ts";
 
 /** The part of the drawn image the OCR result covers, as fractions (a screenshot may only cover the visible part). */
 interface Region {
@@ -128,8 +129,8 @@ export class ImageTranslator {
     const stage = document.createElement("div");
     stage.className = "img-stage";
     const badge = document.createElement("div");
-    badge.className = "img-badge";
-    badge.innerHTML = `<span class="ico">${TRANSLATE_ICON}</span><span class="spin"></span><span class="label"></span><button class="btn peek" title="원문 보기 / 번역 보기">원문</button><button class="x" title="번역 지우기">×</button>`;
+    badge.className = "img-badge float";
+    badge.innerHTML = `${SPINNER}<span class="label"></span><button class="btn ghost icon sm peek" title="원문 보기">${icon("eye")}</button><button class="btn ghost icon sm x" title="번역 지우기">${icon("x")}</button>`;
     root.append(stage, badge);
     const ro = new ResizeObserver(() => this.place(o));
     const o: Overlay = {

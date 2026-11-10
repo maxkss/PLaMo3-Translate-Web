@@ -5,46 +5,51 @@
     <title>PLaMo Translate</title>
     <link rel="stylesheet" href="pages.css" />
     <style>
-      body { width: 320px; padding: 14px; }
-      .stack { gap: 12px; }
-      #page { width: 100%; padding: 9px; }
-      select { width: 100%; }
+      /* the popup takes the inner (card) colour of the other surfaces; its switch rows sit on it directly */
+      body { width: 320px; background: var(--bg-muted); }
+      .rows { background: transparent; border: 0; border-radius: 0; }
+      .rows > li + li { border-top: 0; }
+      main { padding: 12px 16px 16px; display: flex; flex-direction: column; gap: 12px; }
+      header { display: flex; align-items: center; gap: 8px; margin-right: -6px; }
+      header h1 { flex: 1; font-size: 14px; line-height: 20px; }
+      .rows .set-row { padding: 4px 0; }
     </style>
   </head>
   <body>
-    <div class="stack">
-      <div class="row" style="justify-content: space-between">
-        <h1>PLaMo 3 Translate</h1>
-        <span class="muted">온디바이스 · 2B</span>
+    <main>
+      <header>
+        <h1>PLaMo Translate</h1>
+        <button class="btn ghost icon sm" id="options" title="설정"><i data-icon="settings"></i></button>
+      </header>
+
+      <div id="notice" class="banner error hidden" role="status">
+        <span id="noticeIcon" style="display: contents"></span><span class="title" id="noticeText"></span>
+        <button class="btn sm" id="noticeAction">설치</button>
       </div>
 
-      <label class="stack" style="gap: 4px; align-items: stretch">
-        <span class="muted">번역할 언어</span>
-        <select id="lang"></select>
-      </label>
+      <span class="select"><select id="lang" title="번역할 언어"></select></span>
 
-      <div class="stack" style="gap: 4px">
-        <span class="muted">페이지 번역 표시</span>
-        <div class="seg">
-          <input type="radio" name="mode" id="mode-dual" value="dual" /><label for="mode-dual">원문 + 번역</label>
-          <input type="radio" name="mode" id="mode-replace" value="replace" /><label for="mode-replace">번역만</label>
-        </div>
+      <div class="seg fill" role="radiogroup" aria-label="페이지 번역 표시">
+        <label data-text="원문 + 번역"><input type="radio" name="mode" value="dual" />원문 + 번역</label>
+        <label data-text="번역만"><input type="radio" name="mode" value="replace" />번역만</label>
       </div>
 
-      <button id="page" class="primary">이 페이지 번역</button>
+      <button id="page" class="btn primary lg block" title="Alt+Shift+T">이 페이지 번역</button>
 
-      <div class="stack" style="gap: 6px">
-        <label><input type="checkbox" id="selButton" /> 텍스트 선택 시 번역 버튼 표시</label>
-        <label><input type="checkbox" id="selAuto" /> 선택하면 바로 번역</label>
-      </div>
+      <ul class="rows">
+        <li class="set-row">
+          <label class="set-line" title="Alt+T"><span class="set-text"><span class="set-title">선택하면 번역 버튼</span></span><input type="checkbox" class="switch" id="selButton" /></label>
+        </li>
+        <li class="set-row">
+          <label class="set-line"><span class="set-text"><span class="set-title">선택하면 바로 번역</span></span><input type="checkbox" class="switch" id="selAuto" /></label>
+        </li>
+      </ul>
 
-      <div class="card stack" style="gap: 6px; padding: 10px 12px">
+      <div id="statusBox" style="display: flex; flex-direction: column; gap: 8px">
         <div class="status"><span class="dot" id="dot"></span><span id="status">엔진 연결 중…</span></div>
         <div class="bar hidden" id="bar"><i></i></div>
-        <a href="#" id="options" class="muted">모델 설정 · 테스트</a>
       </div>
-      <div class="muted">단축키: Alt+Shift+T 페이지 번역, Alt+T 선택 영역 번역</div>
-    </div>
+    </main>
     <script type="module" src="popup.js"></script>
   </body>
 </html>

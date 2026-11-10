@@ -12,7 +12,7 @@ import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { chromium } from "playwright";
-import { profileDir } from "./lib.mjs";
+import { profileDir, translateIn } from "./lib.mjs";
 
 const headed = process.argv.includes("--headed");
 const dist = resolve("dist");
@@ -66,11 +66,7 @@ try {
     ["会議は来週の月曜日に変更されました。資料は前日までに共有してください。", "ko"],
     ["안녕하세요, 오늘 날씨가 정말 좋네요. 내일 회의에서 뵙겠습니다.", "en"],
   ]) {
-    await opts.fill("#src", text);
-    await opts.selectOption("#lang", lang);
-    await opts.click("#go");
-    await opts.waitForFunction(() => document.getElementById("speed").textContent || /오류/.test(document.getElementById("out").textContent), null, { timeout: 120_000 });
-    log(`[${lang}]`, await opts.textContent("#out"), "|", await opts.textContent("#speed"));
+    log(`[${lang}]`, await translateIn(opts, text, lang));
   }
   await opts.screenshot({ path: join(shots, "options.png"), fullPage: true });
 
@@ -107,13 +103,9 @@ try {
   // ---- an interactive request while the page is being translated must not wait for the page job
   await page.waitForTimeout(400);
   const tSel = performance.now();
-  await opts.fill("#src", "Interactive requests should jump ahead of background page translation.");
-  await opts.selectOption("#lang", "ko");
-  await opts.evaluate(() => (document.getElementById("speed").textContent = ""));
-  await opts.click("#go");
-  await opts.waitForFunction(() => document.getElementById("speed").textContent, null, { timeout: 60_000 });
+  const interactive = await translateIn(opts, "Interactive requests should jump ahead of background page translation.", "ko");
   const pageBusy = await page.evaluate(() => !document.querySelectorAll("li plamo-tr").length || !document.querySelector("#late plamo-tr"));
-  log(`interactive during page translation: ${((performance.now() - tSel) / 1000).toFixed(2)}s (page still translating: ${pageBusy}) ->`, await opts.textContent("#out"));
+  log(`interactive during page translation: ${((performance.now() - tSel) / 1000).toFixed(2)}s (page still translating: ${pageBusy}) ->`, interactive);
   await page.waitForFunction(() => {
     const done = (el) => !!el && (el.hasAttribute("data-plamo-done") || !!el.querySelector("[data-plamo-done]"));
     return ["p1", "p2", "late"].every((id) => done(document.getElementById(id))) && [...document.querySelectorAll("li")].every(done);

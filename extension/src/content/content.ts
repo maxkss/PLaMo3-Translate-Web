@@ -67,12 +67,12 @@ async function main(): Promise<void> {
     });
     const p = panel;
     p.onOpenOptions(() => void chrome.runtime.sendMessage({ type: "open-options" }));
-    unsubscribeStatus = client.onStatus((s) => p.setFooter(statusText(s)));
+    p.setStatus(client.status);
+    unsubscribeStatus = client.onStatus((s) => p.setStatus(s));
     const run = (lang: string) => {
       if (selReqId) client.cancel([selReqId]);
       const id = (selReqId = client.newId());
-      p.setPending("번역 중…");
-      const t0 = performance.now();
+      p.setLoading();
       client
         .translate({ id, text, targetLang: lang, priority: 0 }, (partial) => {
           if (selReqId === id) p.setText(partial, true);
@@ -81,13 +81,12 @@ async function main(): Promise<void> {
           (out) => {
             if (selReqId !== id) return;
             p.setText(out, false);
-            p.setFooter(`${statusText(client.status)} · ${((performance.now() - t0) / 1000).toFixed(1)}s`);
             selReqId = null;
           },
           (e: Error) => {
             if (e?.name === "AbortError" || selReqId !== id) return;
-            p.setPending(`번역하지 못했습니다: ${e.message}`);
-            p.setFooter(statusText(client.status));
+            p.setError(`번역하지 못했습니다: ${e.message}`);
+            p.setStatus(client.status);
           },
         );
     };
@@ -138,7 +137,7 @@ async function main(): Promise<void> {
   // ------------------------------------------------------------------ page
 
   const page = new PageTranslator(client);
-  let pillUpdate: ((label: string, progress: number | null) => void) | null = null;
+  let pillUpdate: ReturnType<Ui["showPill"]> | null = null;
   let lastError = "";
   let pageStatusUnsub: (() => void) | null = null;
 
@@ -151,12 +150,16 @@ async function main(): Promise<void> {
     page.onProgress = ({ done, total, running }) => {
       if (!pillUpdate) return;
       const s = client.status;
-      if (s && (s.state === "loading" || s.state === "downloading" || s.state === "missing" || s.state === "error")) {
-        pillUpdate(statusText(s), s.progress ?? null);
-      } else if (lastError) {
-        pillUpdate(`일부 번역 실패: ${lastError}`, total ? done / total : null);
+      if (s?.state === "missing") {
+        pillUpdate("모델 설치 필요", null, "warn");
+      } else if (s?.state === "error") {
+        pillUpdate(statusText(s), null, "error");
+      } else if (s && (s.state === "loading" || s.state === "downloading")) {
+        pillUpdate(statusText(s), s.progress ?? null, "busy");
+      } else if (running || done < total) {
+        pillUpdate(`번역 중 · ${done}/${total}`, total ? done / total : null, "busy");
       } else {
-        pillUpdate(running || done < total ? `번역 중 · ${done}/${total}` : `번역 완료 · ${total}개 문단`, total ? done / total : null);
+        pillUpdate(lastError ? `일부 번역 실패: ${lastError}` : "번역 완료", null, lastError ? "warn" : "done");
       }
     };
     page.onError = (msg) => {

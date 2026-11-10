@@ -74,7 +74,19 @@ export interface Settings {
   /** Optional base URL that serves onnx/model_q4f16.onnx(+_data); empty = the pinned Hugging Face repo. */
   modelUrlOverride: string;
   backend: Backend;
+  /** Unload the models after this many minutes without work (0 = keep them loaded). */
+  idleUnloadMin: number;
 }
+
+/** Choices for Settings.idleUnloadMin. */
+export const IDLE_UNLOAD_CHOICES: [minutes: number, label: string][] = [
+  [0, "내리지 않음"],
+  [1, "1분 후"],
+  [5, "5분 후"],
+  [10, "10분 후"],
+  [30, "30분 후"],
+  [60, "1시간 후"],
+];
 
 export const DEFAULT_SETTINGS: Settings = {
   targetLang: "ko",
@@ -86,6 +98,7 @@ export const DEFAULT_SETTINGS: Settings = {
   ocrModel: "mobile",
   modelUrlOverride: "",
   backend: "auto",
+  idleUnloadMin: 0,
 };
 
 export async function getSettings(): Promise<Settings> {
@@ -345,6 +358,7 @@ export type ClientToEngine =
   | { type: "select-model"; model: ModelId }
   | { type: "load" }
   | { type: "unload" }
+  | { type: "idle-changed" }
   | { type: "delete-model"; model: ModelId };
 
 export type EngineToClient =
