@@ -61,12 +61,18 @@ export type DisplayMode = "dual" | "replace";
 export type Backend = "auto" | "webgpu" | "wasm";
 
 export interface Settings {
+  /** Language for page and image translation (the popup's choice). */
   targetLang: string;
+  /** Language last chosen in the selection panel; empty = follow targetLang. Kept apart so changing it there does
+   *  not re-translate the page. */
+  selectionLang: string;
   displayMode: DisplayMode;
   /** Show the floating translate button when text is selected. */
   selectionButton: boolean;
   /** Translate immediately on selection instead of showing the button first. */
   selectionAuto: boolean;
+  /** Keep translating after the tab navigates: a tab whose page was being translated starts again on the next page. */
+  keepOnNavigate: boolean;
   /** Which model size to run. */
   model: ModelId;
   /** OCR recognition model for image translation: mobile (small, the default) or server (more accurate, 5× larger) */
@@ -90,15 +96,17 @@ export const IDLE_UNLOAD_CHOICES: [minutes: number, label: string][] = [
 
 export const DEFAULT_SETTINGS: Settings = {
   targetLang: "ko",
-  displayMode: "dual",
+  selectionLang: "",
+  displayMode: "replace",
   selectionButton: true,
   selectionAuto: false,
+  keepOnNavigate: false,
   // the light model by default (fast and small enough for phones); 2B is the more accurate choice in the settings
   model: "0.8b",
   ocrModel: "mobile",
   modelUrlOverride: "",
   backend: "auto",
-  idleUnloadMin: 0,
+  idleUnloadMin: 5,
 };
 
 export async function getSettings(): Promise<Settings> {
@@ -376,5 +384,9 @@ export type BackgroundMessage =
   | { type: "page-toggle"; tabId?: number }
   | { type: "open-options" }
   | { type: "get-settings" }
+  /** the sender tab's page translation started or stopped (remembered for Settings.keepOnNavigate) */
+  | { type: "page-active"; active: boolean }
+  /** whether the sender tab's page was being translated before it navigated (answers a boolean) */
+  | { type: "page-was-active" }
   /** screenshot of the sender's visible tab (fallback for images the extension cannot fetch) */
   | { type: "capture-visible" };

@@ -58,7 +58,8 @@ async function main(): Promise<void> {
       ? { left: rect.left + window.scrollX, top: rect.top + window.scrollY, bottom: rect.bottom + window.scrollY }
       : { left: window.scrollX + window.innerWidth / 2 - 220, top: window.scrollY + 80, bottom: window.scrollY + 80 };
     unsubscribeStatus?.();
-    panel = u.openPanel(anchor, settings.targetLang, () => {
+    const lang = settings.selectionLang || settings.targetLang;
+    panel = u.openPanel(anchor, lang, () => {
       if (selReqId) client.cancel([selReqId]);
       selReqId = null;
       panel = null;
@@ -91,10 +92,11 @@ async function main(): Promise<void> {
         );
     };
     p.onLangChange((lang) => {
-      void setSettings({ targetLang: lang });
+      // only the selection panel's own language: the page translation keeps the popup's targetLang
+      void setSettings({ selectionLang: lang });
       run(lang);
     });
-    run(settings.targetLang);
+    run(lang);
   }
 
   document.addEventListener(
@@ -151,15 +153,15 @@ async function main(): Promise<void> {
       if (!pillUpdate) return;
       const s = client.status;
       if (s?.state === "missing") {
-        pillUpdate("모델 설치 필요", null, "warn");
+        pillUpdate("모델 설치 필요", "warn");
       } else if (s?.state === "error") {
-        pillUpdate(statusText(s), null, "error");
+        pillUpdate(statusText(s), "error");
       } else if (s && (s.state === "loading" || s.state === "downloading")) {
-        pillUpdate(statusText(s), s.progress ?? null, "busy");
+        pillUpdate(statusText(s), "busy");
       } else if (running || done < total) {
-        pillUpdate(`번역 중 · ${done}/${total}`, total ? done / total : null, "busy");
+        pillUpdate(`번역 중 · ${done}/${total}`, "busy");
       } else {
-        pillUpdate(lastError ? `일부 번역 실패: ${lastError}` : "번역 완료", null, lastError ? "warn" : "done");
+        pillUpdate(lastError ? `일부 번역 실패: ${lastError}` : "번역 완료", lastError ? "warn" : "done");
       }
     };
     page.onError = (msg) => {
@@ -168,10 +170,12 @@ async function main(): Promise<void> {
     pageStatusUnsub?.();
     pageStatusUnsub = client.onStatus(() => page.active && page.onProgress(page.progress()));
     page.start(settings.targetLang, settings.displayMode);
+    void chrome.runtime.sendMessage({ type: "page-active", active: true }).catch(() => {});
   }
 
   function stopPage(): void {
     page.stop();
+    void chrome.runtime.sendMessage({ type: "page-active", active: false }).catch(() => {});
     pageStatusUnsub?.();
     pageStatusUnsub = null;
     ui?.hidePill();
@@ -212,4 +216,12 @@ async function main(): Promise<void> {
     }
     return false;
   });
+
+  // the tab was translating the page it came from: carry on with this one
+  if (window === window.top) {
+    const wasActive = settings.keepOnNavigate && (await chrome.runtime.sendMessage({ type: "page-was-active" }).catch(() => false));
+    if (wasActive && !page.active) startPage();
+    // a new page that is not translated clears the tab's mark, so turning the option on later does not revive it
+    else if (!page.active) void chrome.runtime.sendMessage({ type: "page-active", active: false }).catch(() => {});
+  }
 }

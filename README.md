@@ -3,7 +3,7 @@
 A Chrome extension that runs [PLaMo 3 Translate](https://huggingface.co/pfnet/plamo-3-translate-2b) (0.8B / 2B) directly in the browser with WebGPU. No text is sent to a server.
 
 - **Selection translation** — select text and click the translate button (or use the context menu, or `Alt+T`). The result streams in.
-- **Whole-page translation** — from the popup or `Alt+Shift+T`. Translates the entire page starting from what is on screen, keeps inline formatting (links, bold, code), and follows dynamically added content and SPA navigation. Shows the translation below the original or in place of it; the original can be restored at any time.
+- **Whole-page translation** — from the popup or `Alt+Shift+T`. Translates the entire page starting from what is on screen, keeps inline formatting (links, bold, code), and follows dynamically added content and SPA navigation. Shows the translation in place of the original (the default) or below it; the original can be restored at any time. Text fields and editable areas are left untouched. With **Keep translating on navigation** on, a translated tab carries on translating after following a link.
 - **Image translation** — right-click an image and choose the PLaMo image translation item. Text in the image is read with OCR, translated, erased from the picture and redrawn in the same position, size and color.
 - 53 target languages. The default is Korean.
 

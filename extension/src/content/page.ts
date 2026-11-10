@@ -395,6 +395,25 @@ function isSkippedTree(el: Element | null): boolean {
   return false;
 }
 
+/**
+ * Form fields and editable regions: never part of a unit, so they are not counted, moved, copied (dual mode) or
+ * re-translated while the user types in them.
+ */
+function isEditField(el: Element): boolean {
+  const t = el.tagName;
+  if (t === "TEXTAREA" || t === "SELECT") return true;
+  if (t === "INPUT") return (el as HTMLInputElement).type !== "hidden";
+  return !!(el as HTMLElement).isContentEditable;
+}
+
+const EDIT_FIELDS = 'input:not([type="hidden"]), textarea, select, [contenteditable]:not([contenteditable="false"])';
+
+/** True for a node inside a text field or editable region (typing there changes the DOM). */
+function inEditField(n: Node): boolean {
+  const el = n.nodeType === Node.ELEMENT_NODE ? (n as Element) : n.parentElement;
+  return !!el && (!!(el as HTMLElement).isContentEditable || !!el.closest("textarea, select"));
+}
+
 const noTranslate = (e: Element) =>
   e.getAttribute("translate") === "no" || e.classList.contains("notranslate") || (e as HTMLElement).isContentEditable;
 
@@ -440,7 +459,7 @@ export class PageTranslator {
   /** running transition animations (cancelled on stop) */
   private anims = new Set<Animation>();
   private target = "ko";
-  private mode: DisplayMode = "dual";
+  private mode: DisplayMode = "replace";
   onProgress: (p: PageProgress) => void = () => {};
   onError: (msg: string) => void = () => {};
 
@@ -631,9 +650,20 @@ export class PageTranslator {
       if (c.nodeType === Node.ELEMENT_NODE) {
         const el = c as HTMLElement;
         if (el.tagName === "PLAMO-TR" || el.tagName === "PLAMO-TRANSLATE-UI") continue;
+        // a field cuts the run and stays out of it: the text on either side is translated around it
+        if (isEditField(el)) {
+          flush();
+          continue;
+        }
         if (!SKIP_TAGS.has(el.tagName) && !INVISIBLE_TAGS.has(el.tagName)) {
           if (this.isBlock(el)) {
             flush();
+            continue;
+          }
+          // a field inside an inline element (<label>Search <input></label>): the element's text is split around it
+          if (!noTranslate(el) && el.querySelector(EDIT_FIELDS)) {
+            flush();
+            this.runsOf(el, out);
             continue;
           }
           if (!noTranslate(el) && this.hasBlockInside(el)) {
@@ -1418,6 +1448,8 @@ export class PageTranslator {
   private onMutations(records: MutationRecord[]): void {
     if (!this.active) return;
     for (const r of records) {
+      // typing in a field or editable region is the user's, not the page's
+      if (inEditField(r.target)) continue;
       if (r.type === "characterData") {
         const t = r.target as Text;
         if (this.ours.has(t)) continue;

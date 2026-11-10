@@ -37,11 +37,12 @@
 /* SegmentedControl — track padding 4px, item height = control height − 8px, selected = surface fill + 600 */
 .seg { display: inline-flex; gap: 2px; padding: 4px; height: 32px; border-radius: var(--r-element); background: var(--neutral); }
 .seg label {
-  position: relative; display: inline-grid; align-items: center; justify-items: center; height: 24px; padding: 0 12px;
+  position: relative; display: inline-grid; grid-template-rows: 1fr 0; align-items: center; justify-items: center; height: 24px; padding: 0 12px;
   border-radius: var(--r-inner); font-weight: 500; color: var(--text-2); white-space: nowrap; cursor: pointer;
   transition-property: color, background-color, background-image; transition-duration: var(--fast); transition-timing-function: var(--ease);
 }
-/* reserves the semibold width so selecting does not shift the items */
+/* reserves the semibold width so selecting does not shift the items; its zero-height row keeps the label's own
+   row at the full height, so the text stays centred instead of sharing the free space with this row */
 .seg label::after { content: attr(data-text); font-weight: 600; height: 0; visibility: hidden; overflow: hidden; }
 .seg input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
 @media (hover: hover) { .seg label:hover:not(:has(input:checked)) { background-image: linear-gradient(var(--hover), var(--hover)); } }
@@ -73,20 +74,30 @@
 .select.ghost > select:focus { border-color: transparent; box-shadow: none; }
 .select.ghost > select:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 
-/* Switch (md) — the thumb grows from 16 to 20 when on */
-.switch {
-  appearance: none; margin: 0; flex: none; position: relative; cursor: pointer;
-  width: 40px; height: 24px; border-radius: 9999px; background-color: var(--border-strong);
-  transition: background-color var(--fast) var(--ease);
+/* CheckboxInput (sm) — 20px box, 1px border, inner radius; checked = accent fill with a 12px on-accent check;
+   the label (medium weight) follows 8px after the box; the whole row is the hover and press target */
+.check-line { display: flex; align-items: center; gap: 8px; min-height: 28px; font-weight: 500; cursor: pointer; }
+.check {
+  appearance: none; position: relative; display: block; flex: none; box-sizing: border-box; width: 20px; height: 20px; margin: 0;
+  border: 1px solid var(--border-strong); border-radius: var(--r-inner); background-color: var(--bg); cursor: pointer;
+  transition-property: background-color, border-color; transition-duration: var(--fast); transition-timing-function: var(--ease);
 }
-.switch::after {
-  content: ""; position: absolute; top: 4px; left: 4px; width: 16px; height: 16px; border-radius: 9999px; background: var(--bg);
-  transition-property: transform, width, height, top, left; transition-duration: var(--fast); transition-timing-function: var(--ease);
+.check::before {
+  content: ""; position: absolute; inset: 0; margin: auto; width: 12px; height: 12px; display: none; background-color: var(--on-accent);
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E%3Cpath d='M8.5 2.5L4 7.5L1.5 5' stroke='%23000' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat;
 }
-@media (hover: hover) { .switch:hover { background-color: color-mix(in srgb, var(--border-strong), var(--tint) 5%); } }
-.switch:checked { background-color: var(--accent); }
-@media (hover: hover) { .switch:checked:hover { background-color: color-mix(in srgb, var(--accent), var(--tint) 15%); } }
-.switch:checked::after { top: 2px; left: 2px; width: 20px; height: 20px; transform: translateX(16px); }
+.check::after { content: ""; position: absolute; inset: -1px; border-radius: inherit; pointer-events: none; }
+.check:checked { border-color: var(--accent); background-color: var(--accent); }
+.check:checked::before { display: block; }
+@media (hover: hover) {
+  .check-line:hover .check, .check:hover {
+    border-color: color-mix(in srgb, var(--border-strong), var(--tint) 20%); background-color: color-mix(in srgb, var(--bg), var(--tint) 5%);
+  }
+  .check-line:hover .check:checked, .check:checked:hover {
+    border-color: color-mix(in srgb, var(--accent), var(--tint) 15%); background-color: color-mix(in srgb, var(--accent), var(--tint) 15%);
+  }
+}
+@media (pointer: fine) { .check-line:active .check::after, .check:active::after { background-color: var(--pressed); } }
 
 /* Banner — status colours, 20px icon, semibold title, ghost actions in the status colour */
 .banner {

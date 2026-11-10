@@ -67,6 +67,35 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
   if (command === "translate-selection") void sendToTab(tabId, { type: "translate-selection" });
 });
 
+// ---- tabs whose page is being translated (for Settings.keepOnNavigate)
+// Kept in session storage so the set survives this worker being suspended; it is cleared with the browser session.
+
+const ACTIVE_TABS = "pageActiveTabs";
+let tabsLock: Promise<unknown> = Promise.resolve();
+
+async function activeTabs(): Promise<number[]> {
+  const got = await chrome.storage.session.get(ACTIVE_TABS);
+  return (got[ACTIVE_TABS] as number[] | undefined) ?? [];
+}
+
+/** Adds or removes a tab; updates run one after another so concurrent changes are not lost. */
+function setTabActive(tabId: number, active: boolean): Promise<unknown> {
+  tabsLock = tabsLock.then(async () => {
+    const tabs = await activeTabs();
+    const has = tabs.includes(tabId);
+    if (has === active) return;
+    await chrome.storage.session.set({ [ACTIVE_TABS]: active ? [...tabs, tabId] : tabs.filter((t) => t !== tabId) });
+  }).catch(() => {});
+  return tabsLock;
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => void setTabActive(tabId, false));
+// a link opened in a new tab from a translated page carries the translation along
+chrome.tabs.onCreated.addListener(async (tab) => {
+  if (tab.id == null || tab.openerTabId == null) return;
+  if ((await activeTabs()).includes(tab.openerTabId)) void setTabActive(tab.id, true);
+});
+
 chrome.runtime.onMessage.addListener((msg: BackgroundMessage, sender, sendResponse) => {
   switch (msg.type) {
     case "ensure-engine":
@@ -78,6 +107,15 @@ chrome.runtime.onMessage.addListener((msg: BackgroundMessage, sender, sendRespon
     case "page-toggle": {
       const tabId = msg.tabId ?? sender.tab?.id;
       if (tabId) sendToTab(tabId, { type: "page-toggle" }).then(() => sendResponse({ ok: true }), (e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+    case "page-active":
+      if (sender.tab?.id != null) void setTabActive(sender.tab.id, msg.active);
+      break;
+    case "page-was-active": {
+      const tabId = sender.tab?.id;
+      if (tabId == null || sender.frameId) return false;
+      tabsLock.then(activeTabs).then((tabs) => sendResponse(tabs.includes(tabId)), () => sendResponse(false));
       return true;
     }
     case "get-settings":

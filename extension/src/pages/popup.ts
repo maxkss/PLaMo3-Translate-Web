@@ -22,6 +22,9 @@ selButton.checked = settings.selectionButton;
 selAuto.checked = settings.selectionAuto;
 selButton.addEventListener("change", () => void setSettings({ selectionButton: selButton.checked }));
 selAuto.addEventListener("change", () => void setSettings({ selectionAuto: selAuto.checked }));
+const keepNav = $<HTMLInputElement>("keepNav");
+keepNav.checked = settings.keepOnNavigate;
+keepNav.addEventListener("change", () => void setSettings({ keepOnNavigate: keepNav.checked }));
 
 const openOptions = () => void chrome.runtime.openOptionsPage();
 $("options").addEventListener("click", openOptions);

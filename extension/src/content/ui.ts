@@ -47,11 +47,11 @@ const OVERLAY_CSS = `
 @keyframes rise { from { opacity: 0; transform: translateY(8px); } }
 .pill .label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
 .pill .state { display: grid; place-items: center; width: 20px; height: 20px; flex: none; }
+.pill .state:empty { display: none; }
 .pill .state .i { width: 20px; height: 20px; }
 .pill .state[data-tone="warn"] { color: var(--on-warning-muted); }
 .pill .state[data-tone="error"] { color: var(--on-error-muted); }
 .pill .end { display: flex; align-items: center; gap: 8px; height: 20px; margin-inline-end: -4px; }
-.pill .bar { width: 64px; flex: none; }
 /* image translation overlay (content/image.ts) */
 .img-ov { position: fixed; z-index: 2147483646; overflow: hidden; pointer-events: none; }
 .img-stage { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
@@ -68,9 +68,7 @@ const OVERLAY_CSS = `
 }
 .img-badge .label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 4px; }
 .img-ov.peek .img-badge .peek { background-color: var(--pressed); color: var(--text); }
-.img-badge .spin { display: none; }
-.img-badge.busy { padding: 8px 12px 8px 8px; gap: 8px; }
-.img-badge.busy .spin { display: block; }
+.img-badge.busy { padding: 8px 12px; }
 .img-badge.busy .btn { display: none; }
 /* when finished the badge is just its buttons, faint until hovered */
 .img-badge.done { padding: 4px; }
@@ -242,12 +240,12 @@ export class Ui {
     cb?.();
   }
 
-  /** The page-progress toast; the returned update sets its label, progress bar and leading icon. */
-  showPill(opts: { onRestore: () => void; onClose: () => void }): (label: string, progress: number | null, tone: PillTone) => void {
+  /** The page-progress toast; the returned update sets its label and leading icon. */
+  showPill(opts: { onRestore: () => void; onClose: () => void }): (label: string, tone: PillTone) => void {
     this.pill?.remove();
     const pill = document.createElement("div");
     pill.className = "pill float";
-    pill.innerHTML = `<span class="state"></span><span class="label"></span><span class="end"><span class="bar"><i></i></span><button class="btn sm restore">원문 보기</button><button class="btn ghost icon sm x" title="숨기기">${icon("x")}</button></span>`;
+    pill.innerHTML = `<span class="state"></span><span class="label"></span><span class="end"><button class="btn sm restore">원문 보기</button><button class="btn ghost icon sm x" title="숨기기">${icon("x")}</button></span>`;
     pill.querySelector(".restore")!.addEventListener("click", opts.onRestore);
     pill.querySelector(".x")!.addEventListener("click", () => {
       pill.classList.add("hidden");
@@ -256,19 +254,16 @@ export class Ui {
     this.root.append(pill);
     this.pill = pill;
     const label = pill.querySelector<HTMLSpanElement>(".label")!;
-    const bar = pill.querySelector<HTMLElement>(".bar")!;
-    const fill = pill.querySelector<HTMLElement>(".bar > i")!;
     const state = pill.querySelector<HTMLElement>(".state")!;
     let shown: PillTone | null = null;
-    return (text, progress, tone) => {
+    return (text, tone) => {
       label.textContent = text;
       if (tone !== shown) {
-        state.innerHTML = tone === "busy" ? SPINNER : icon(tone === "done" ? "check" : tone === "warn" ? "warning" : "error", 20);
+        // while translating the label says enough: no spinning icon
+        state.innerHTML = tone === "busy" ? "" : icon(tone === "done" ? "check" : tone === "warn" ? "warning" : "error", 20);
         state.dataset.tone = tone;
         shown = tone;
       }
-      bar.classList.toggle("hidden", tone !== "busy" || progress == null);
-      if (progress != null) fill.style.width = `${Math.round(progress * 100)}%`;
     };
   }
 
