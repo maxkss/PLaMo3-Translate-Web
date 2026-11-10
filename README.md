@@ -16,8 +16,8 @@ The models are 4-bit quantized ONNX conversions that run on onnxruntime-web. Wit
 
 ## Installation
 
-1. Build the extension (see [Build](#build)).
-2. Open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked** and select `extension/dist`.
+1. Download `plamo-translate-<version>.zip` from the [latest release](https://github.com/maxkss/PLaMo3-Translate-Web/releases/latest) and unzip it, or build the extension yourself (see [Build](#build)).
+2. Open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked** and select the unzipped folder (or `extension/dist` if you built it).
 3. Open the extension's options page (the model settings link in the popup), choose 0.8B or 2B and click the download button.
 
 The model is downloaded from Hugging Face at a pinned commit, and every file is checked against its size and SHA-256. An interrupted download resumes where it stopped. Models are stored in the extension's Origin Private File System, so translation works offline afterwards. Both models can be installed side by side and switched at any time.
@@ -48,7 +48,9 @@ The result is `models/onnx/plamo-3-translate-<size>/onnx/model_q4f16.onnx` and `
 
 ## License
 
-The PLaMo 3 Translate models and the converted weights are covered by the [PLaMo Community License](https://plamo.preferredai.jp/info/plamo-community-license-ja). Personal and non-commercial use is free; commercial use requires prior registration with Preferred Networks or a separate agreement. The license also applies when the converted models are redistributed. Built with PLaMo.
+The source code in this repository is released under the [MIT License](LICENSE).
+
+The models are licensed separately. The PLaMo 3 Translate models and the converted weights are covered by the [PLaMo Community License](https://plamo.preferredai.jp/info/plamo-community-license-ja). Personal and non-commercial use is free; commercial use requires prior registration with Preferred Networks or a separate agreement. The license also applies when the converted models are redistributed. Built with PLaMo.
 
 Third-party models downloaded by the extension:
 
