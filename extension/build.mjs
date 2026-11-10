@@ -1,6 +1,6 @@
 // Bundles the extension into dist/. `node build.mjs --watch` rebuilds on change.
 import * as esbuild from "esbuild";
-import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 
 const watch = process.argv.includes("--watch");
 const out = "dist";
@@ -50,8 +50,8 @@ const builds = [
   // content scripts are classic scripts
   { entryPoints: { content: "src/content/content.ts" }, format: "iife" },
 ];
-// dev-only latency benchmark pages (BENCH=1 npm run build)
-if (process.env.BENCH) {
+// dev-only latency benchmark pages (BENCH=1 npm run build); src/dev is local-only and not in the repository
+if (process.env.BENCH && existsSync("src/dev")) {
   for (const rt of ["asyncify", "jspi"]) {
     builds.push({ entryPoints: { [`bench-${rt}`]: `src/dev/bench-${rt}.ts` }, format: "esm" });
     writeFileSync(`${out}/bench-${rt}.html`, `<!doctype html><meta charset="utf-8"><title>bench</title><script type="module" src="bench-${rt}.js"></script>`);
