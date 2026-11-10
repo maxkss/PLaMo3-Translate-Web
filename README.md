@@ -22,7 +22,7 @@ The models are 4-bit quantized ONNX conversions that run on onnxruntime-web. Wit
 
 The model is downloaded from Hugging Face at a pinned commit, and every file is checked against its size and SHA-256. An interrupted download resumes where it stopped. Models are stored in the extension's Origin Private File System, so translation works offline afterwards. Both models can be installed side by side and switched at any time.
 
-The OCR model for image translation (PP-OCRv5, 21 MB) and the inpainting model (MI-GAN, 28 MB) are downloaded the first time they are needed.
+The download also includes the models for image translation: OCR (PP-OCRv5, 21 MB) and inpainting (MI-GAN, 28 MB). The extension works once everything is installed; nothing is fetched later while translating.
 
 ## Build
 

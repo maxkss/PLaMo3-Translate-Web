@@ -168,19 +168,19 @@ export class ImageTranslator {
 
   private async translate(img: HTMLImageElement, src: string, targetLang: string): Promise<void> {
     const o = this.create(img, src);
-    this.status(o, "이미지 읽는 중…", true);
-    const progress = (message: string) => this.overlays.get(img) === o && this.status(o, message, true);
+    // one label for the whole job (reading, erasing and translating are not told apart)
+    this.status(o, "번역 중…", true);
     let outcome: OcrOutcome;
     const t0 = performance.now();
     try {
       try {
-        outcome = await this.client.ocr({ src, targetLang }, progress);
+        outcome = await this.client.ocr({ src, targetLang });
       } catch (e) {
         if (!/^FETCH_FAILED/.test((e as Error).message)) throw e;
         // the extension could not fetch it (blob: URL, unsupported format, …): read what the page shows instead
         const alt = await this.readFromPage(img, src);
         o.region = alt.region;
-        outcome = await this.client.ocr({ dataUrl: alt.dataUrl, targetLang }, progress);
+        outcome = await this.client.ocr({ dataUrl: alt.dataUrl, targetLang });
       }
     } catch (e) {
       if (this.overlays.get(img) === o) this.status(o, `읽지 못했습니다: ${(e as Error).message.replace(/^FETCH_FAILED: /, "")}`, false);
@@ -278,9 +278,7 @@ export class ImageTranslator {
     // but hurt others (¥ read as yen, English UI words translated), so it is left out
     const all = result.paragraphs.map((p) => p.text).join("\n");
     const context = todo.length > 1 && all.length <= 400 ? all : null;
-    let done = 0;
     let failed = 0;
-    this.status(o, `번역 중 · 0/${todo.length}`, true);
     const texts = Promise.all(
       todo.map((p) => {
         const id = this.client.newId();
@@ -290,10 +288,6 @@ export class ImageTranslator {
           .catch((e: Error) => {
             if (e?.name !== "AbortError") failed++;
             return null;
-          })
-          .finally(() => {
-            done++;
-            if (live() && done < todo.length) this.status(o, `번역 중 · ${done}/${todo.length}`, true);
           });
       }),
     );
@@ -334,7 +328,7 @@ export class ImageTranslator {
       inpaint: result.pending.length ? Math.round(tPatches) : 0,
       render: Math.round(performance.now() - tBuild),
     });
-    this.status(o, failed ? `번역 완료 · ${todo.length - failed}개 (실패 ${failed}개)` : `번역 완료 · ${todo.length}개`, false, !failed);
+    this.status(o, failed ? `번역 완료 (실패 ${failed}개)` : "번역 완료", false, !failed);
   }
 }
 

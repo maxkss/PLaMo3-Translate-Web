@@ -1,6 +1,6 @@
 import { importModelFiles } from "../engine/storage.ts";
 import { EngineClient, statusText } from "../shared/client.ts";
-import { LANGUAGES, MODELS, getSettings, modelBytes, setSettings, type Backend, type EngineStatus, type ModelId, type Settings } from "../shared/common.ts";
+import { INPAINT_MODEL, LANGUAGES, MODELS, OCR_MODELS, getSettings, modelBytes, setSettings, type Backend, type EngineStatus, type ModelId, type Settings } from "../shared/common.ts";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const settings = await getSettings();
@@ -12,6 +12,15 @@ let installed: ModelId[] = [];
 let selected: ModelId = settings.model;
 const radios = [...document.querySelectorAll<HTMLInputElement>('input[name="model"]')];
 
+// ---- image OCR model (part of the install: changing it may need another download)
+const ocrModel = $<HTMLSelectElement>("ocrModel");
+ocrModel.value = settings.ocrModel;
+ocrModel.addEventListener("change", async () => {
+  await setSettings({ ocrModel: ocrModel.value as Settings["ocrModel"] });
+  await client.send({ type: "select-model", model: selected });
+  renderModel();
+});
+
 function renderModel(): void {
   const info = MODELS[selected];
   for (const r of radios) r.checked = r.value === selected;
@@ -22,7 +31,9 @@ function renderModel(): void {
   const busy = state === "downloading";
   const dl = $<HTMLButtonElement>("download");
   dl.disabled = busy || has;
-  dl.textContent = has ? `${info.label} 설치됨` : `${info.label} 내려받기 (${(modelBytes(info) / 1e9).toFixed(2)} GB)`;
+  // everything the extension needs comes in this one download: the translation model plus the image-translation models
+  const bytes = modelBytes(info) + modelBytes(OCR_MODELS[ocrModel.value as Settings["ocrModel"]] ?? OCR_MODELS.mobile) + modelBytes(INPAINT_MODEL);
+  dl.textContent = has ? `${info.label} 설치됨` : `${info.label} 내려받기 (${(bytes / 1e9).toFixed(2)} GB)`;
   $("cancelDl").classList.toggle("hidden", !busy);
   $<HTMLButtonElement>("delete").disabled = !has || busy;
   $<HTMLButtonElement>("load").disabled = !has;
@@ -87,11 +98,6 @@ folder.addEventListener("change", async () => {
     msg.textContent = `실패: ${(e as Error).message}`;
   }
 });
-
-// ---- image OCR model (downloaded the first time an image is translated with it)
-const ocrModel = $<HTMLSelectElement>("ocrModel");
-ocrModel.value = settings.ocrModel;
-ocrModel.addEventListener("change", () => void setSettings({ ocrModel: ocrModel.value as Settings["ocrModel"] }));
 
 // ---- backend / lifecycle
 const backend = $<HTMLSelectElement>("backend");

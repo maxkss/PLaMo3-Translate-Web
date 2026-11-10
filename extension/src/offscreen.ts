@@ -61,9 +61,24 @@ async function selectedModel(): Promise<ModelId> {
   return model in MODELS ? model : "0.8b";
 }
 
+/** What image translation needs besides the translation model: the selected OCR model and the inpainting model. */
+async function extraModels(): Promise<StoredModel[]> {
+  const { ocrModel } = await getSettings();
+  return [OCR_MODELS[ocrModel] ?? OCR_MODELS.mobile, INPAINT_MODEL];
+}
+
+/**
+ * Translation models that are ready to use. A model only counts as installed together with the image-translation
+ * models: everything is downloaded in one go, and nothing is fetched later in the middle of a translation.
+ */
+async function installedModels(): Promise<ModelId[]> {
+  for (const m of await extraModels()) if (!(await isInstalled(m))) return [];
+  return listInstalled();
+}
+
 /** Recompute idle/missing and the installed list for the selected model (when nothing is in flight). */
 async function refreshStatus(message?: string): Promise<void> {
-  const [model, installed] = await Promise.all([selectedModel(), listInstalled()]);
+  const [model, installed] = await Promise.all([selectedModel(), installedModels()]);
   const patch: Partial<EngineStatus> = { model, installed };
   if (!loaded && !loading && !downloadAbort) {
     patch.state = installed.includes(model) ? "idle" : "missing";
@@ -137,7 +152,7 @@ async function ensureLoaded(): Promise<void> {
   const gen = loadGen;
   const { backend, model } = await getSettings();
   const info = MODELS[model] ?? MODELS["0.8b"];
-  if (!(await isInstalled(info))) {
+  if (!(await installedModels()).includes(info.id)) {
     if (loading?.promise === promise) loading = null;
     setStatus({ state: "missing", model: info.id, message: `${info.label} 모델이 설치되지 않았습니다. 설정에서 내려받아 주세요.` });
     reject(new Error(`${info.label} 모델이 설치되지 않았습니다`));
@@ -333,9 +348,6 @@ const ocrJobs = new Map<number, { resolve: (r: OcrResult) => void; reject: (e: E
 const patchJobs = new Map<number, (p: ErasePatch[]) => void>();
 /** recent results (with every patch) by image URL and target language, so toggling an image back on is instant */
 const ocrCache = new Map<string, OcrResult>();
-const installs = new Map<StoredModel, Promise<void>>();
-/** requesters waiting for a model download (they get progress messages) */
-const ocrWaiting = new Set<{ port: chrome.runtime.Port; id: string }>();
 
 function getOcrWorker(): Worker {
   if (ocrWorker) return ocrWorker;
@@ -364,27 +376,6 @@ function getOcrWorker(): Worker {
   return (ocrWorker = w);
 }
 
-/** Download a model once (shared by concurrent requests); progress goes to everyone waiting. */
-function ensureModel(model: StoredModel, what: string): Promise<void> {
-  let p = installs.get(model);
-  if (!p) {
-    p = (async () => {
-      if (await isInstalled(model)) return;
-      const total = modelBytes(model);
-      let last = 0;
-      await downloadModel(model, "", (loaded) => {
-        const now = performance.now();
-        if (now - last < 250) return;
-        last = now;
-        const message = `${what} 내려받는 중… ${(loaded / 1e6).toFixed(0)} / ${(total / 1e6).toFixed(0)} MB (처음 한 번)`;
-        for (const w of ocrWaiting) safePost(w.port, { type: "ocr-progress", id: w.id, message, progress: loaded / total });
-      });
-    })().finally(() => installs.delete(model));
-    installs.set(model, p);
-  }
-  return p;
-}
-
 async function readImage(req: OcrRequest): Promise<ImageBitmap> {
   const url = req.dataUrl ?? req.src;
   if (!url) throw new Error("FETCH_FAILED: 이미지 주소가 없습니다");
@@ -409,11 +400,10 @@ async function handleOcr(req: OcrRequest, port: chrome.runtime.Port): Promise<vo
   const key = req.src && !req.dataUrl ? `${req.src}\u0001${req.targetLang}\u0001${ocrModel}` : null;
   const hit = key ? ocrCache.get(key) : undefined;
   if (hit) return safePost(port, { type: "ocr-done", id: req.id, result: hit });
-  const waiter = { port, id: req.id };
   try {
-    ocrWaiting.add(waiter);
-    const [image] = await Promise.all([readImage(req), ensureModel(OCR_MODELS[ocrModel], "OCR 모델")]);
-    safePost(port, { type: "ocr-progress", id: req.id, message: "글자 인식 중…" });
+    const ocr = OCR_MODELS[ocrModel];
+    if (!(await isInstalled(ocr)) || !(await isInstalled(INPAINT_MODEL))) throw new Error("모델이 설치되지 않았습니다. 설정에서 내려받아 주세요.");
+    const image = await readImage(req);
     const job = ocrSeq++;
     const result = await new Promise<OcrResult>((resolve, reject) => {
       ocrJobs.set(job, { resolve, reject });
@@ -424,8 +414,6 @@ async function handleOcr(req: OcrRequest, port: chrome.runtime.Port): Promise<vo
     let more: ErasePatch[] = [];
     if (result.pending.length) {
       try {
-        await ensureModel(INPAINT_MODEL, "배경 복원 모델");
-        safePost(port, { type: "ocr-progress", id: req.id, message: "배경 복원 중…" });
         more = await new Promise<ErasePatch[]>((resolve) => {
           patchJobs.set(job, resolve);
           getOcrWorker().postMessage({ t: "inpaint", job } satisfies OcrWorkerIn);
@@ -441,8 +429,6 @@ async function handleOcr(req: OcrRequest, port: chrome.runtime.Port): Promise<vo
     }
   } catch (e) {
     safePost(port, { type: "error", id: req.id, message: String((e as Error)?.message ?? e) });
-  } finally {
-    ocrWaiting.delete(waiter);
   }
 }
 
@@ -457,22 +443,25 @@ async function startDownload(id: ModelId): Promise<void> {
   downloadAbort = new AbortController();
   setStatus({ state: "downloading", model: id, progress: 0, message: `${info.label} 모델 내려받는 중…` });
   try {
-    let last = 0;
-    await downloadModel(
-      info,
-      modelSourceUrl(info, modelUrlOverride),
-      (loadedBytes, total) => {
-        const now = performance.now();
-        if (now - last > 250) {
+    // the translation model, then the image-translation models (OCR, inpainting): one download, one progress bar
+    const parts: { m: StoredModel; base: string }[] = [{ m: info, base: modelSourceUrl(info, modelUrlOverride) }, ...(await extraModels()).map((m) => ({ m, base: "" }))];
+    const total = parts.reduce((a, p) => a + modelBytes(p.m), 0);
+    let before = 0, last = 0;
+    for (const { m, base } of parts) {
+      await downloadModel(
+        m,
+        base,
+        (loadedBytes) => {
+          const now = performance.now();
+          if (now - last < 250) return;
           last = now;
-          setStatus({
-            progress: total ? loadedBytes / total : undefined,
-            message: `${info.label} 모델 내려받는 중… ${(loadedBytes / 1e9).toFixed(2)} / ${(total / 1e9).toFixed(2)} GB`,
-          });
-        }
-      },
-      downloadAbort.signal,
-    );
+          const got = before + loadedBytes;
+          setStatus({ progress: got / total, message: `${info.label} 모델 내려받는 중… ${(got / 1e9).toFixed(2)} / ${(total / 1e9).toFixed(2)} GB` });
+        },
+        downloadAbort.signal,
+      );
+      before += modelBytes(m);
+    }
     downloadAbort = null;
     await refreshStatus(`${info.label} 다운로드 완료`);
     if ((await selectedModel()) === id) ensureLoaded().catch(() => {});
@@ -480,7 +469,7 @@ async function startDownload(id: ModelId): Promise<void> {
     downloadAbort = null;
     const aborted = (e as Error)?.name === "AbortError";
     setStatus({ state: "error", message: aborted ? "다운로드를 취소했습니다 (다시 누르면 이어받습니다)" : `다운로드 실패: ${(e as Error)?.message ?? e} (다시 누르면 이어받습니다)` });
-    void listInstalled().then((installed) => setStatus({ installed }));
+    void installedModels().then((installed) => setStatus({ installed }));
   } finally {
     downloadAbort = null;
   }
@@ -527,10 +516,9 @@ chrome.runtime.onConnect.addListener((port) => {
         break;
       case "select-model":
         // settings were already saved by the page; drop the old model so the next job loads the new one
-        if (activeModel !== msg.model) {
-          if (activeModel || loading) await unload();
-          else await refreshStatus();
-        }
+        // (also sent when the OCR model choice changes: the installed list depends on it)
+        if (activeModel !== msg.model && (activeModel || loading)) await unload();
+        else await refreshStatus();
         break;
     }
   });

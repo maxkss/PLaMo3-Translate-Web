@@ -352,7 +352,6 @@ export type EngineToClient =
   | { type: "done"; id: string; text: string; cached?: boolean }
   | { type: "error"; id: string; message: string }
   | { type: "status"; status: EngineStatus }
-  | { type: "ocr-progress"; id: string; message: string; progress?: number }
   | { type: "ocr-done"; id: string; result: OcrResult }
   /** the remaining erased patches (inpainting model); empty if it could not run */
   | { type: "ocr-patches"; id: string; patches: ErasePatch[] };

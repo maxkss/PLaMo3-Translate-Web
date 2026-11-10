@@ -11,7 +11,6 @@ interface Pending {
 interface PendingOcr {
   resolve: (r: OcrResult) => void;
   reject: (e: Error) => void;
-  onProgress?: (message: string, progress?: number) => void;
   /** after the result: the remaining patches (inpainting on photos) */
   patches?: (p: ErasePatch[]) => void;
 }
@@ -63,12 +62,11 @@ export class EngineClient {
     }
     const o = this.pendingOcr.get(m.id);
     if (o) {
-      if (m.type === "ocr-progress") o.onProgress?.(m.message, m.progress);
-      else if (m.type === "ocr-patches") {
+      if (m.type === "ocr-patches") {
         this.pendingOcr.delete(m.id);
         o.patches?.(m.patches);
       } else if (m.type === "ocr-done") {
-        // stay registered for the patches (and their progress) when some are still being made
+        // stay registered for the patches when some are still being made
         if (!m.result.pending.length) this.pendingOcr.delete(m.id);
         o.resolve(m.result);
       } else if (m.type === "error") {
@@ -78,7 +76,7 @@ export class EngineClient {
       return;
     }
     const p = this.pending.get(m.id);
-    if (!p || m.type === "ocr-progress" || m.type === "ocr-done" || m.type === "ocr-patches") return;
+    if (!p || m.type === "ocr-done" || m.type === "ocr-patches") return;
     if (m.type === "delta") p.onDelta?.(m.text);
     else {
       this.pending.delete(m.id);
@@ -110,14 +108,14 @@ export class EngineClient {
     });
   }
 
-  /** OCR an image (see OcrRequest); onProgress reports the one-time model download and the recognition step. */
-  async ocr(req: Omit<OcrRequest, "type" | "id">, onProgress?: (message: string, progress?: number) => void): Promise<OcrOutcome> {
+  /** OCR an image (see OcrRequest). */
+  async ocr(req: Omit<OcrRequest, "type" | "id">): Promise<OcrOutcome> {
     const id = this.newId();
     const port = await this.connect();
     let patches!: (p: ErasePatch[]) => void;
     const morePatches = new Promise<ErasePatch[]>((r) => (patches = r));
     const result = await new Promise<OcrResult>((resolve, reject) => {
-      this.pendingOcr.set(id, { resolve, reject, onProgress, patches });
+      this.pendingOcr.set(id, { resolve, reject, patches });
       port.postMessage({ ...req, type: "ocr", id } satisfies OcrRequest);
     });
     if (!result.pending.length) patches([]);
