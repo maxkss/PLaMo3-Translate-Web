@@ -1,0 +1,12 @@
+models/
+node_modules/
+extension/dist/
+.venv/
+__pycache__/
+*.onnx
+*.onnx_data
+.DS_Store
+
+# evaluation images (rebuilt by extension/eval/build.mjs; most sources forbid redistribution)
+extension/eval/data/
+extension/eval/results/

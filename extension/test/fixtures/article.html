@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>On-device translation test page</title>
+<style>body{font:16px/1.6 Georgia,serif;max-width:720px;margin:40px auto;padding:0 16px} nav a{margin-right:12px}</style></head>
+<body>
+  <nav><a href="#">Home</a><a href="#">Articles</a><a href="#">About us</a></nav>
+  <h1>Running language models in the browser</h1>
+  <p id="p1">WebGPU gives web pages direct access to the graphics card, which makes it possible to run neural networks locally without sending any data to a server.</p>
+  <p id="p2">This paragraph contains <a href="https://example.com">a link to another page</a> and some <strong>bold text</strong> in the middle of the sentence.</p>
+  <ul>
+    <li>Privacy: your text never leaves the device.</li>
+    <li>Latency: there is no network round trip.</li>
+    <li>Cost: no API fees are charged per request.</li>
+  </ul>
+  <pre><code>const session = await ort.InferenceSession.create(model);</code></pre>
+  <p id="ko">이 문단은 이미 한국어이므로 번역하지 않아야 합니다.</p>
+  <p id="sel">Select this sentence to test the floating translate button.</p>
+  <div id="dyn"></div>
+  <script>
+    setTimeout(() => {
+      const p = document.createElement("p");
+      p.id = "late";
+      p.textContent = "This paragraph was added dynamically after the page loaded.";
+      document.getElementById("dyn").append(p);
+    }, 1500);
+  </script>
+</body>
+</html>

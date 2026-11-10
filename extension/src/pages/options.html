@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PLaMo Translate 설정</title>
+    <link rel="stylesheet" href="pages.css" />
+    <style>
+      body { padding: 32px 16px; }
+      main { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 18px; }
+      header h1 { font-size: 22px; }
+      #url { width: 100%; }
+      .models { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px; }
+      .model { align-items: flex-start; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: var(--bg); cursor: pointer; }
+      .model:has(input:checked) { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+      .model input { margin-top: 4px; }
+      .badge { font-size: 11px; font-weight: 500; color: #2f9e44; margin-left: 4px; }
+      summary { cursor: pointer; }
+      #out { min-height: 80px; white-space: pre-wrap; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+      code { font-size: 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 1px 4px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header class="stack" style="gap: 4px">
+        <h1>PLaMo 3 Translate · 온디바이스</h1>
+        <div class="muted">PLaMo 3 Translate(4-bit)를 브라우저 안에서 WebGPU로 실행합니다. 텍스트는 기기 밖으로 전송되지 않습니다.</div>
+      </header>
+
+      <section class="card stack">
+        <h2>모델</h2>
+        <div class="models" id="models">
+          <label class="model" data-id="0.8b">
+            <input type="radio" name="model" value="0.8b" />
+            <span class="stack" style="gap: 2px">
+              <b>0.8B <span class="badge" data-badge></span></b>
+              <span class="muted">0.50 GB · 더 빠르고 가벼움</span>
+            </span>
+          </label>
+          <label class="model" data-id="2b">
+            <input type="radio" name="model" value="2b" />
+            <span class="stack" style="gap: 2px">
+              <b>2B <span class="badge" data-badge></span></b>
+              <span class="muted">1.62 GB · 번역 품질이 더 좋음</span>
+            </span>
+          </label>
+        </div>
+        <div class="status"><span class="dot" id="dot"></span><span id="status">엔진 연결 중…</span></div>
+        <div class="bar hidden" id="bar"><i></i></div>
+
+        <div class="row">
+          <button id="download" class="primary">내려받기</button>
+          <button id="cancelDl" class="hidden">취소</button>
+          <span class="muted" id="source"></span>
+        </div>
+
+        <div class="row">
+          <label class="muted">실행 백엔드
+            <select id="backend">
+              <option value="auto">자동 (WebGPU 우선)</option>
+              <option value="webgpu">WebGPU</option>
+              <option value="wasm">WebAssembly (CPU)</option>
+            </select>
+          </label>
+          <label class="muted">이미지 OCR
+            <select id="ocrModel">
+              <option value="mobile">가벼움 (21 MB)</option>
+              <option value="server">정확함 (89 MB)</option>
+            </select>
+          </label>
+          <span style="flex: 1"></span>
+          <button id="load">지금 불러오기</button>
+          <button id="unload">메모리에서 내리기</button>
+          <button id="delete" class="danger">모델 삭제</button>
+        </div>
+
+        <details>
+          <summary class="muted">고급: 다른 주소나 로컬 폴더에서 설치</summary>
+          <div class="stack" style="gap: 10px; margin-top: 10px">
+            <div class="stack" style="gap: 6px">
+              <span class="muted">모델 주소 — <code>onnx/model_q4f16.onnx</code>, <code>onnx/model_q4f16.onnx_data</code>를 제공하는 기본 URL. 비워 두면 Hugging Face에서 받습니다. 파일은 어느 주소에서 받든 체크섬으로 확인합니다.</span>
+              <input type="url" id="url" placeholder="https://huggingface.co/… (기본값)" />
+            </div>
+            <div class="stack" style="gap: 6px">
+              <span class="muted">또는 변환한 모델 폴더(<code>models/onnx/plamo-3-translate-&lt;크기&gt;/onnx</code>)를 선택한 모델로 가져오기</span>
+              <div class="row">
+                <input type="file" id="folder" webkitdirectory multiple class="hidden" />
+                <button id="pick">폴더에서 가져오기…</button>
+                <span class="muted" id="importMsg"></span>
+              </div>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <section class="card stack">
+        <h2>번역 테스트</h2>
+        <textarea id="src" rows="4">PLaMo 3 Translate runs entirely in your browser, so the pages you read never leave your device.</textarea>
+        <div class="row">
+          <select id="lang"></select>
+          <button id="go" class="primary">번역</button>
+          <span class="muted" id="speed"></span>
+        </div>
+        <div id="out" class="muted">결과가 여기에 표시됩니다.</div>
+      </section>
+
+      <footer class="muted">
+        원본 모델: <a id="baseLink" target="_blank" rel="noreferrer"></a> · 변환본: <a id="repoLink" target="_blank" rel="noreferrer"></a> ·
+        <a href="https://plamo.preferredai.jp/info/plamo-community-license-ja" target="_blank" rel="noreferrer">PLaMo Community License</a>.
+        Built with PLaMo.
+      </footer>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

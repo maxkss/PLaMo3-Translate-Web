@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "PLaMo Translate (On-device)",
+  "short_name": "PLaMo Translate",
+  "version": "0.1.0",
+  "description": "PLaMo 3 Translate(0.8B·2B)를 브라우저에서 직접 실행해 선택 영역과 웹페이지 전체를 번역합니다. Built with PLaMo.",
+  "minimum_chrome_version": "121",
+  "permissions": ["offscreen", "storage", "unlimitedStorage", "contextMenus", "scripting", "activeTab"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "content_scripts": [
+    { "matches": ["<all_urls>"], "js": ["content.js"], "run_at": "document_idle" }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "PLaMo Translate",
+    "default_icon": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" }
+  },
+  "icons": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" },
+  "options_page": "options.html",
+  "commands": {
+    "translate-page": {
+      "suggested_key": { "default": "Alt+Shift+T" },
+      "description": "이 페이지 번역 / 원문 보기"
+    },
+    "translate-selection": {
+      "suggested_key": { "default": "Alt+T" },
+      "description": "선택한 텍스트 번역"
+    }
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
+  "cross_origin_embedder_policy": { "value": "require-corp" },
+  "cross_origin_opener_policy": { "value": "same-origin" }
+}
