@@ -12,8 +12,11 @@
  *    Concurrent generate() calls are batched (continuous batching, up to `maxBatch` sequences) when the graph has a
  *    symbolic batch dimension: each sequence is prefilled alone in the single-sequence buffers, its KV is copied into
  *    a row of the batch buffers, and all rows then decode together with per-row lengths (seqlens_k). Rows that finish
- *    are refilled from the queue. With up to 3 rows the tokens are the same as decoding each sequence alone.
+ *    are refilled from the queue, a few at a time (1, 2, 4…) so the first ones start at once. With up to 3 rows the
+ *    tokens are the same as decoding each sequence alone; wider batches (Settings.batchSize) change a word here and there.
  *    `interactive` sequences jump the queue and decode alone while the batch waits.
+ *    Decode steps are pipelined: the argmax writes the next input token on the GPU, and the next step is queued
+ *    before the previous one's tokens are read back.
  *  - Otherwise (wasm, Node tests, or a dynamic-KV graph): the cache grows by concatenation and is fed back at its
  *    exact length; logits are read on the CPU. Calls run one at a time.
  *
@@ -22,6 +25,7 @@
  */
 
 import type { InferenceSession, Tensor, TypedTensor } from "onnxruntime-common";
+import { EXACT_BATCH, KV_CAPACITY } from "../shared/common.ts";
 
 export interface OrtLike {
   Tensor: typeof Tensor;
@@ -49,10 +53,13 @@ export interface GenerateResult {
 
 /** Max total sequence (prompt + output). Must stay within the 2048-token sliding window. */
 export const MAX_CONTEXT = 2040;
-/** Capacity of the static KV buffers (>= MAX_CONTEXT). */
-export const KV_CAPACITY = 2048;
-/** Largest batch that gives exactly the same tokens as decoding alone (measured; larger batches pick other kernels). */
-export const MAX_BATCH = 3;
+/**
+ * Default batch: the largest that gives exactly the same tokens as decoding alone (measured; larger batches pick
+ * other kernels). Wider batches (Settings.batchSize) are much faster and change a word here and there.
+ */
+export const MAX_BATCH = EXACT_BATCH;
+/** Decode steps kept in flight: the next step is queued while the previous step's tokens are read back. */
+const PIPELINE_DEPTH = 2;
 
 export interface GpuOptions {
   device: GPUDevice;
@@ -295,7 +302,7 @@ export class Generator {
     this.solo = s;
   }
 
-  private async run(key: string, fn: (rebind: boolean) => Promise<number[]>): Promise<number[]> {
+  private async run<T>(key: string, fn: (rebind: boolean) => Promise<T>): Promise<T> {
     const rebind = key === "prefill" || key !== this.bound;
     this.bound = key;
     return fn(rebind);
@@ -318,26 +325,63 @@ export class Generator {
     return tok;
   }
 
-  private async soloStep(s: Seq): Promise<number> {
+  /**
+   * Decode `rows` (the solo sequence in the single-sequence buffers, or the batch rows) until one of them finishes or
+   * is aborted, or `more()` says the scheduler has something else to do. Up to PIPELINE_DEPTH steps are in flight:
+   * each step's argmax writes the next input token on the GPU, so a step is queued before the previous one's tokens
+   * are read back (the readback alone takes a few ms). When a row finishes, the steps already queued are still read
+   * (the other rows' tokens are valid; the finished row's extra KV entries are never used). Returns the rows that
+   * finished. The rows do not change while steps are in flight.
+   */
+  private async burst(rows: Seq[], solo: boolean, more: () => boolean): Promise<Set<Seq>> {
     const g = this.gpu!;
-    const t0 = performance.now();
-    const [tok] = await this.run("solo", (rb) => g.step(this.session, [s.next], s.tokens.length, false, rb));
-    g.cached.push(s.next);
-    s.tokens.push(s.next);
-    s.decodeMs += performance.now() - t0;
-    return tok;
+    const b = rows.length;
+    const key = solo ? "solo" : `batch${b}`;
+    const pending: Promise<number[]>[] = [];
+    const finished = new Set<Seq>();
+    let stop = false;
+    let first = true;
+    let last = performance.now();
+    try {
+      for (;;) {
+        if (!stop && pending.length < PIPELINE_DEPTH && (first || !more())) {
+          // the first step feeds the known tokens; later ones read what the previous step's argmax wrote
+          const feed = first ? rows.map((s) => s.next) : null;
+          const k = pending.length;
+          const { tokens } = await this.run(key, (rb) =>
+            solo
+              ? g.submit(this.session, feed, rows[0].tokens.length + k, false, rb)
+              : this.batch!.submit(this.session, feed, rows.map((s) => s.tokens.length + k), rb),
+          );
+          pending.push(tokens);
+          first = false;
+          if (pending.length < PIPELINE_DEPTH) continue;
+        }
+        if (!pending.length) return finished;
+        const toks = await pending.shift()!;
+        const now = performance.now();
+        const share = (now - last) / b;
+        last = now;
+        rows.forEach((s, r) => {
+          if (finished.has(s)) return;
+          s.tokens.push(s.next);
+          if (solo) g.cached.push(s.next);
+          s.decodeMs += share;
+          if (this.accept(s, toks[r])) finished.add(s);
+        });
+        if (finished.size || rows.some((s) => s.o.signal?.aborted)) stop = true;
+      }
+    } catch (e) {
+      for (const p of pending) p.catch(() => {});
+      throw e;
+    }
   }
 
   /** Prefill and decode an interactive sequence to the end, alone (batched rows keep their KV and wait). */
   private async runAlone(s: Seq): Promise<void> {
-    let tok = await this.prefill(s);
-    while (!this.accept(s, tok)) {
-      if (s.o.signal?.aborted) {
-        this.finish(s, "abort");
-        return;
-      }
-      tok = await this.soloStep(s);
-    }
+    if (this.accept(s, await this.prefill(s))) return;
+    const finished = await this.burst([s], true, () => false);
+    if (!finished.has(s)) this.finish(s, "abort");
   }
 
   private async tick(): Promise<void> {
@@ -352,7 +396,7 @@ export class Generator {
         else {
           // no batching: finish the running sequence first
           this.waiting.unshift(s);
-          await this.decodeStep();
+          await this.decode();
           return;
         }
       }
@@ -360,8 +404,11 @@ export class Generator {
       return;
     }
 
-    // 2. admit queued sequences while there are free rows
-    while (this.waiting.length && this.active() < this.maxBatch) {
+    // 2. admit queued sequences while there are free rows, in stages (1, then up to as many as are decoding: 1, 2, 4,
+    //    8…): each one is prefilled before the next decode step, so the first ones start decoding without waiting for
+    //    a whole batch of prefills
+    let admit = Math.max(1, this.active());
+    while (this.waiting.length && this.active() < this.maxBatch && admit-- > 0) {
       const s = this.waiting.shift()!;
       const alone = this.active() === 0;
       if (!alone && this.solo) this.soloToRow();
@@ -377,36 +424,20 @@ export class Generator {
     // the batch shrank to one row and nothing is waiting: continue in the single-sequence buffers
     if (this.rows.length === 1 && !this.waiting.length) this.rowToSolo();
 
-    // 3. one decode step for everything active
-    await this.decodeStep();
+    // 3. decode everything active until a row finishes or the scheduler has a sequence to admit
+    await this.decode();
   }
 
-  private async decodeStep(): Promise<void> {
+  private async decode(): Promise<void> {
+    const more = () => this.waiting.length > 0 && (this.active() < this.maxBatch || this.waiting.some((w) => w.o.interactive));
     if (this.solo) {
       const s = this.solo;
-      if (this.accept(s, await this.soloStep(s))) this.solo = null;
+      if ((await this.burst([s], true, more)).has(s)) this.solo = null;
       return;
     }
     if (!this.rows.length) return;
-    const b = this.rows.length;
-    const batch = this.batch!;
-    const t0 = performance.now();
-    const toks = await this.run(`batch${b}`, (rb) =>
-      batch.step(
-        this.session,
-        this.rows.map((s) => s.next),
-        this.rows.map((s) => s.tokens.length),
-        rb,
-      ),
-    );
-    const share = (performance.now() - t0) / b;
-    const done: number[] = [];
-    this.rows.forEach((s, r) => {
-      s.tokens.push(s.next);
-      s.decodeMs += share;
-      if (this.accept(s, toks[r])) done.push(r);
-    });
-    for (const r of done.reverse()) this.removeRow(r, null);
+    const finished = await this.burst(this.rows.slice(), false, more);
+    for (let r = this.rows.length - 1; r >= 0; r--) if (finished.has(this.rows[r])) this.removeRow(r, null);
   }
 
   // ------------------------------------------------------------------ dynamic KV (wasm / Node / old graphs)
@@ -533,7 +564,7 @@ class GpuState {
     this.total = this.tensor("int32", [], 4);
     const logits = this.tensor("float32", [1, 1, VOCAB], VOCAB * 4);
     this.fetches.logits = logits;
-    this.argmax = new GpuArgmax(this.device, logits.gpuBuffer as GPUBuffer, 1);
+    this.argmax = new GpuArgmax(this.device, logits.gpuBuffer as GPUBuffer, this.ids.gpuBuffer as GPUBuffer, 1);
   }
 
   /** KV buffer of one past input (layout [1, heads, capacity, headDim]) */
@@ -547,21 +578,27 @@ class GpuState {
     return this.ort.Tensor.fromGpuBuffer(b, { dataType: type, dims });
   }
 
-  /**
-   * Run the model on `input` (written at KV positions [pos, pos + input.length)) and return the greedy next token.
-   * `prefill`: multi-token prompt pass (uncaptured, binds its own input buffer); `rebind`: onnxruntime has other
-   * tensors bound (after a prefill or a batched step).
-   */
+  /** Run the model on `input` (see submit) and wait for the greedy next token. */
   async step(session: InferenceSession, input: number[], pos: number, prefill: boolean, rebind: boolean): Promise<number[]> {
+    return (await this.submit(session, input, pos, prefill, rebind)).tokens;
+  }
+
+  /**
+   * Queue the model on `input` (written at KV positions [pos, pos + input.length)); `tokens` resolves to the greedy
+   * next token, which is also written as the next single-token input. `input` null: one token, the one the previous
+   * step's argmax wrote. `prefill`: multi-token prompt pass (uncaptured, binds its own input buffer); `rebind`:
+   * onnxruntime has other tensors bound (after a prefill or a batched step).
+   */
+  async submit(session: InferenceSession, input: number[] | null, pos: number, prefill: boolean, rebind: boolean): Promise<{ tokens: Promise<number[]> }> {
     const q = this.device.queue;
-    const n = input.length;
+    const n = input?.length ?? 1;
     let ids = this.ids;
     let temp: GPUBuffer | null = null;
     if (prefill) {
       temp = keptBuffer(this.device, n * 8, false);
       ids = this.ort.Tensor.fromGpuBuffer(temp, { dataType: "int64", dims: [1, n] });
     }
-    q.writeBuffer(ids.gpuBuffer as GPUBuffer, 0, BigInt64Array.from(input, BigInt));
+    if (input) q.writeBuffer(ids.gpuBuffer as GPUBuffer, 0, BigInt64Array.from(input, BigInt));
     q.writeBuffer(this.seqk.gpuBuffer as GPUBuffer, 0, Int32Array.from([pos + n - 1]));
     q.writeBuffer(this.total.gpuBuffer as GPUBuffer, 0, Int32Array.from([pos + n]));
     const g = globalThis as Record<string, unknown>;
@@ -576,7 +613,7 @@ class GpuState {
       g[REBIND] = false;
       temp?.destroy();
     }
-    return this.argmax.run(1);
+    return { tokens: this.argmax.submit(1) };
   }
 
   dispose(): void {
@@ -628,7 +665,7 @@ class BatchState {
     this.seqk = mk(4 * maxB);
     this.total = mk(4);
     this.logits = mk(VOCAB * 4 * maxB);
-    this.argmax = new GpuArgmax(this.device, this.logits, maxB);
+    this.argmax = new GpuArgmax(this.device, this.logits, this.ids, maxB);
   }
 
   private view(b: number): { feeds: Feeds; fetches: Feeds } {
@@ -676,11 +713,14 @@ class BatchState {
     this.device.queue.submit([enc.finish()]);
   }
 
-  /** One decode step: row i feeds tokens[i] at KV position pos[i]. Returns each row's next token. */
-  async step(session: InferenceSession, tokens: number[], pos: number[], rebind: boolean): Promise<number[]> {
-    const b = tokens.length;
+  /**
+   * Queue one decode step: row i feeds tokens[i] (null: the token the previous step's argmax wrote) at KV position
+   * pos[i]. `tokens` resolves to each row's next token.
+   */
+  async submit(session: InferenceSession, tokens: number[] | null, pos: number[], rebind: boolean): Promise<{ tokens: Promise<number[]> }> {
+    const b = pos.length;
     const q = this.device.queue;
-    q.writeBuffer(this.ids, 0, BigInt64Array.from(tokens, BigInt));
+    if (tokens) q.writeBuffer(this.ids, 0, BigInt64Array.from(tokens, BigInt));
     q.writeBuffer(this.seqk, 0, Int32Array.from(pos));
     q.writeBuffer(this.total, 0, Int32Array.from([Math.max(...pos) + 1]));
     const { feeds, fetches } = this.view(b);
@@ -691,7 +731,7 @@ class BatchState {
     } finally {
       g[REBIND] = false;
     }
-    return this.argmax.run(b);
+    return { tokens: this.argmax.submit(b) };
   }
 
   dispose(): void {
@@ -701,22 +741,29 @@ class BatchState {
   }
 }
 
-/** Index of the largest logit of each row (lowest index on ties), computed on the GPU; a few bytes are read back. */
+/**
+ * Index of the largest logit of each row (lowest index on ties), computed on the GPU; a few bytes are read back. The
+ * index is also written into the model's int64 input_ids buffer (row i at element i), so the next decode step can be
+ * queued before it is read back.
+ */
 class GpuArgmax {
   private readonly device: GPUDevice;
   private readonly pipeline: GPUComputePipeline;
   private readonly bindGroup: GPUBindGroup;
   private readonly out: GPUBuffer;
-  private readonly staging: GPUBuffer;
+  /** one per step in flight (a buffer cannot be mapped again before it is unmapped) */
+  private readonly staging: GPUBuffer[];
+  private slot = 0;
   private readonly bytes: number;
 
-  constructor(device: GPUDevice, logits: GPUBuffer, rows: number) {
+  constructor(device: GPUDevice, logits: GPUBuffer, ids: GPUBuffer, rows: number) {
     this.device = device;
     this.bytes = Math.max(16, Math.ceil((rows * 4) / 16) * 16);
     const module = device.createShaderModule({
       code: /* wgsl */ `
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> o: array<u32>;
+@group(0) @binding(2) var<storage, read_write> ids: array<u32>;
 var<workgroup> bv: array<f32, 256>;
 var<workgroup> bi: array<u32, 256>;
 @compute @workgroup_size(256) fn main(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3<u32>) {
@@ -733,39 +780,48 @@ var<workgroup> bi: array<u32, 256>;
     }
     workgroupBarrier();
   }
-  if (t == 0u) { o[wg.x] = bi[0]; }
+  if (t == 0u) {
+    o[wg.x] = bi[0];
+    ids[2u * wg.x] = bi[0];
+    ids[2u * wg.x + 1u] = 0u;
+  }
 }`,
     });
     this.pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
     this.out = device.createBuffer({ size: this.bytes, usage: BUF.STORAGE | BUF.COPY_SRC });
-    this.staging = device.createBuffer({ size: this.bytes, usage: BUF.MAP_READ | BUF.COPY_DST });
+    this.staging = Array.from({ length: PIPELINE_DEPTH + 1 }, () => device.createBuffer({ size: this.bytes, usage: BUF.MAP_READ | BUF.COPY_DST }));
     this.bindGroup = device.createBindGroup({
       layout: this.pipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: logits, size: rows * VOCAB * 4 } },
         { binding: 1, resource: { buffer: this.out } },
+        { binding: 2, resource: { buffer: ids, size: rows * 8 } },
       ],
     });
   }
 
-  async run(rows: number): Promise<number[]> {
+  /** Queue the argmax of the first `rows` rows; resolves to their indices once read back. */
+  submit(rows: number): Promise<number[]> {
+    const staging = this.staging[this.slot];
+    this.slot = (this.slot + 1) % this.staging.length;
     const enc = this.device.createCommandEncoder();
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipeline);
     pass.setBindGroup(0, this.bindGroup);
     pass.dispatchWorkgroups(rows);
     pass.end();
-    enc.copyBufferToBuffer(this.out, 0, this.staging, 0, this.bytes);
+    enc.copyBufferToBuffer(this.out, 0, staging, 0, this.bytes);
     this.device.queue.submit([enc.finish()]);
-    await this.staging.mapAsync(MAP_READ_MODE);
-    const v = Array.from(new Uint32Array(this.staging.getMappedRange(), 0, rows));
-    this.staging.unmap();
-    return v;
+    return staging.mapAsync(MAP_READ_MODE).then(() => {
+      const v = Array.from(new Uint32Array(staging.getMappedRange(), 0, rows));
+      staging.unmap();
+      return v;
+    });
   }
 
   dispose(): void {
     this.out.destroy();
-    this.staging.destroy();
+    for (const s of this.staging) s.destroy();
   }
 }
 

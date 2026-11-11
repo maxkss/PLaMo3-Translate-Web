@@ -1,5 +1,20 @@
 import { EngineClient, statusText } from "../shared/client.ts";
-import { IDLE_UNLOAD_CHOICES, INPAINT_MODEL, MODELS, OCR_MODELS, getSettings, modelBytes, setSettings, type Backend, type EngineStatus, type ModelId, type Settings } from "../shared/common.ts";
+import {
+  BATCH_CHOICES,
+  EXACT_BATCH,
+  IDLE_UNLOAD_CHOICES,
+  INPAINT_MODEL,
+  MODELS,
+  OCR_MODELS,
+  getSettings,
+  modelBytes,
+  recommendedBatch,
+  setSettings,
+  type Backend,
+  type EngineStatus,
+  type ModelId,
+  type Settings,
+} from "../shared/common.ts";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const radios = (name: string) => [...document.querySelectorAll<HTMLInputElement>(`input[name="${name}"]`)];
@@ -11,6 +26,12 @@ let state: EngineStatus["state"] | undefined;
 let installed: ModelId[] = [];
 let selected: ModelId = settings.model;
 let ocrModel: Settings["ocrModel"] = settings.ocrModel;
+let backend: Backend = settings.backend;
+// the GPU's vendor decides the suggested batch size (null: no WebGPU here)
+const gpuAdapter = await (navigator as Navigator & { gpu?: { requestAdapter(): Promise<{ info?: { vendor?: string } } | null> } }).gpu
+  ?.requestAdapter()
+  .catch(() => null);
+const gpuVendor = gpuAdapter ? (gpuAdapter.info?.vendor ?? "") : null;
 
 function render(): void {
   const info = MODELS[selected];
@@ -34,7 +55,29 @@ function render(): void {
   $<HTMLButtonElement>("unload").disabled = state !== "ready" && state !== "loading";
   $<HTMLAnchorElement>("baseLink").href = `https://huggingface.co/${info.base}`;
   $<HTMLAnchorElement>("repoLink").href = `https://huggingface.co/${info.repo}`;
+  renderBatch();
 }
+
+// ---- batch size: the user's choice; the suggestion depends on the GPU and the model
+const batch = $<HTMLSelectElement>("batchSize");
+for (const n of BATCH_CHOICES) batch.add(new Option(String(n), String(n), false, n === settings.batchSize));
+function renderBatch(): void {
+  const cpu = backend === "wasm" || gpuVendor === null;
+  const rec = recommendedBatch(cpu ? null : gpuVendor, MODELS[selected]);
+  for (const o of batch.options) o.textContent = Number(o.value) === rec.size && !cpu ? `${o.value} (권장)` : o.value;
+  batch.disabled = cpu;
+  $("batchInfo").textContent = cpu
+    ? "CPU에서는 한 번에 하나씩 번역합니다"
+    : `권장 ${rec.size}개 (${rec.reason}). ${EXACT_BATCH}개를 넘으면 빨라지지만 표현이 조금 달라질 수 있고 GPU 메모리를 더 씁니다`;
+}
+batch.addEventListener("change", async () => {
+  await setSettings({ batchSize: Number(batch.value) });
+  // the engine takes it when it loads the model
+  if (state === "ready" || state === "loading") {
+    await client.send({ type: "unload" });
+    await client.send({ type: "load" });
+  }
+});
 
 // ---- model and OCR choice (both are part of the install: changing either may need another download)
 for (const r of radios("model")) {
@@ -78,7 +121,9 @@ for (const r of radios("backend")) {
   r.checked = r.value === settings.backend;
   r.addEventListener("change", async () => {
     if (!r.checked) return;
-    await setSettings({ backend: r.value as Backend });
+    backend = r.value as Backend;
+    await setSettings({ backend });
+    renderBatch();
     if (state === "ready") {
       await client.send({ type: "unload" });
       await client.send({ type: "load" });

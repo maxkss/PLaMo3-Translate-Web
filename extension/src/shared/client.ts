@@ -89,6 +89,18 @@ export class EngineClient {
     (await this.connect()).postMessage(msg);
   }
 
+  /** Connect if needed and wait for the engine's first status (the engine sends it on connect). */
+  async ready(): Promise<EngineStatus> {
+    if (this.status) return this.status;
+    await this.connect();
+    return new Promise((resolve) => {
+      const off = this.onStatus((s) => {
+        queueMicrotask(() => off());
+        resolve(s);
+      });
+    });
+  }
+
   onStatus(cb: (s: EngineStatus) => void): () => void {
     this.statusListeners.add(cb);
     if (this.status) cb(this.status);

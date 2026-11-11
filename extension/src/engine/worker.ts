@@ -11,7 +11,7 @@ import { PlamoTokenizer } from "./tokenizer.ts";
 import { Translator, type TranslateInput, type TranslateStats } from "./translator.ts";
 
 export type WorkerIn =
-  | { t: "load"; gen: number; model: ModelId; backend: "auto" | "webgpu" | "wasm"; extBase: string }
+  | { t: "load"; gen: number; model: ModelId; backend: "auto" | "webgpu" | "wasm"; extBase: string; batch: number }
   | { t: "unload" }
   | { t: "translate"; job: number; input: TranslateInput; stream: boolean; interactive: boolean }
   | { t: "abort"; job: number };
@@ -32,6 +32,8 @@ let generator: Generator | null = null;
 let translator: Translator | null = null;
 let currentBackend = "";
 let currentModel: ModelId | null = null;
+/** Settings.batchSize the model was loaded with */
+let currentBatch = 0;
 const aborts = new Map<number, AbortController>();
 /** load/unload run in order, each after the translations already started have settled */
 let chain: Promise<unknown> = Promise.resolve();
@@ -75,8 +77,8 @@ async function release(): Promise<void> {
   session = null;
 }
 
-async function load(gen: number, id: ModelId, pref: "auto" | "webgpu" | "wasm", extBase: string): Promise<void> {
-  if (translator && currentModel === id) {
+async function load(gen: number, id: ModelId, pref: "auto" | "webgpu" | "wasm", extBase: string, batch: number): Promise<void> {
+  if (translator && currentModel === id && currentBatch === batch) {
     post({ t: "loaded", gen, model: id, backend: currentBackend, ms: 0, batch: generator?.maxBatch ?? 1 });
     return;
   }
@@ -100,17 +102,26 @@ async function load(gen: number, id: ModelId, pref: "auto" | "webgpu" | "wasm", 
       generator = new Generator(session, ort, {
         numKvHeads: info.numKvHeads,
         headDim: info.headDim,
-        gpu: backend === "webgpu" ? { device: (await ort.env.webgpu.device) as GPUDevice, capture } : undefined,
+        gpu:
+          backend === "webgpu"
+            ? { device: (await ort.env.webgpu.device) as GPUDevice, capture, maxBatch: Math.max(1, Math.min(16, Math.round(batch) || 1)) }
+            : undefined,
       });
       translator = new Translator(tok, generator);
       // warm-up: compiles the GPU pipelines (and captures the decode graph) so the first real request is fast;
-      // then the batched shapes
+      // then the batched shapes (texts of different lengths, so the batch also shrinks through its sizes)
       await translator.translate({ text: "Hello.", targetLang: "ko" });
       if (generator.maxBatch > 1) {
-        await Promise.all(["Thank you.", "Good morning.", "See you."].slice(0, generator.maxBatch).map((text) => translator!.translate({ text, targetLang: "ko" })));
+        const texts = ["Thank you.", "Good morning.", "See you.", "Welcome back.", "Read more", "Sign in to continue.", "Latest news", "Contact us"];
+        await Promise.all(
+          Array.from({ length: generator.maxBatch }, (_, i) => (i < texts.length ? texts[i] : `${texts[i % texts.length]} (${i + 1})`)).map((text) =>
+            translator!.translate({ text, targetLang: "ko" }),
+          ),
+        );
       }
       currentBackend = backend === "webgpu" && !capture ? "webgpu (no capture)" : backend;
       currentModel = id;
+      currentBatch = batch;
       post({ t: "loaded", gen, model: id, backend: currentBackend, ms: performance.now() - t0, batch: generator.maxBatch });
       return;
     } catch (e) {
@@ -127,7 +138,7 @@ self.onmessage = (ev: MessageEvent<WorkerIn>) => {
   switch (m.t) {
     case "load":
       chain = chain.then(settled()).then(() =>
-        load(m.gen, m.model, m.backend, m.extBase).catch((e) => post({ t: "load-error", gen: m.gen, message: String((e as Error)?.message ?? e) })),
+        load(m.gen, m.model, m.backend, m.extBase, m.batch).catch((e) => post({ t: "load-error", gen: m.gen, message: String((e as Error)?.message ?? e) })),
       );
       break;
     case "unload":

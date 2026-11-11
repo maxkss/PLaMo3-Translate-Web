@@ -49,7 +49,7 @@ const LOOK = [
   "paddingRight", "marginLeft", "marginRight", "fontVariantCaps",
 ] as const;
 
-/** units requested at once: the engine decodes up to 3 together, one more waits so a finished row refills at once */
+/** units requested at once (at least; more when the engine decodes more together, see EngineStatus.batch) */
 const MAX_INFLIGHT = 4;
 /**
  * Units are translated in groups: one request, one line per unit (a unit's text has no line breaks). The model keeps
@@ -69,11 +69,18 @@ const MAX_INFLIGHT = 4;
  * engine/translator.ts, which packs the lines of a request that is longer after all into as few calls as fit).
  */
 const GROUP_TOKENS = 340;
+/**
+ * The budget when the engine decodes many requests together (EngineStatus.batch >= 8): a group's translation takes as
+ * long as its longest request, so smaller groups fill the batch and finish sooner (a 44-paragraph article: 22.9 s →
+ * 12.6 s, first paragraph 9 s → 4.8 s). A group still holds a few neighbouring paragraphs; alone (80 tokens), they
+ * lose each other's context (the register changed between paragraphs).
+ */
+const WIDE_GROUP_TOKENS = 170;
 const GROUP_SIZE = 16;
-/** test hook: <html data-plamo-group-tokens="N"> overrides GROUP_TOKENS (for comparisons) */
-const groupTokens = () => {
+/** test hook: <html data-plamo-group-tokens="N"> overrides the budget (for comparisons) */
+const groupTokens = (engineBatch: number) => {
   const v = Number(document.documentElement.dataset.plamoGroupTokens);
-  return Number.isFinite(v) && v > 0 ? v : GROUP_TOKENS;
+  return Number.isFinite(v) && v > 0 ? v : engineBatch >= 8 ? WIDE_GROUP_TOKENS : GROUP_TOKENS;
 };
 /** landmarks and widgets: a group never crosses their boundary, however small they are */
 const HARD = [
@@ -432,6 +439,12 @@ export class PageTranslator {
   private byParent = new WeakMap<Node, Unit>();
   /** units were added or dropped since the groups were made */
   private groupsStale = true;
+  /** token budget the current groups were made with */
+  private groupBudget = 0;
+  /** EngineStatus.batch last seen (0: not known yet) */
+  private engineBatch = 0;
+  /** the engine's status was asked for before the first request (or that failed) */
+  private statusAsked = false;
   /** nodes we created (text nodes in replace mode); never scanned */
   private ours = new WeakSet<Node>();
   private blockCache = new WeakMap<Element, boolean>();
@@ -465,6 +478,13 @@ export class PageTranslator {
 
   constructor(client: EngineClient) {
     this.client = client;
+    // the engine's batch decides how many requests to keep in flight and how large groups are: re-plan when it changes
+    // (it becomes known once the model is loaded)
+    client.onStatus((s) => {
+      if ((s.batch ?? 0) === this.engineBatch) return;
+      this.engineBatch = s.batch ?? 0;
+      if (this.active) this.pump();
+    });
   }
 
   start(target: string, mode: DisplayMode): void {
@@ -948,8 +968,26 @@ export class PageTranslator {
    * columns, main content first), then off-screen units by distance from the viewport (below before
    * above), then units that are not rendered at all (hidden menus, collapsed sections).
    */
+  /** Requests kept in flight: enough to fill the engine's batch (it decodes that many together). */
+  private maxInflight(): number {
+    return Math.max(MAX_INFLIGHT, this.engineBatch);
+  }
+
   private pump(): void {
-    if (!this.active || this.inflight >= MAX_INFLIGHT) return;
+    if (!this.active) return;
+    // know the engine's batch before the first request, so the first groups are sized for it
+    if (!this.client.status && !this.statusAsked) {
+      this.statusAsked = true;
+      void this.client
+        .ready()
+        .catch(() => {}) // the requests report the failure
+        .finally(() => this.pump());
+      return;
+    }
+    const max = this.maxInflight();
+    if (this.inflight >= max) return;
+    // the engine's batch became known (or changed): group the pending units for it
+    if (groupTokens(this.engineBatch) !== this.groupBudget) this.groupsStale = true;
     const vw = document.documentElement.clientWidth;
     const vh = window.innerHeight;
     const ranked = this.units
@@ -968,7 +1006,7 @@ export class PageTranslator {
       })
       .sort((x, y) => x.score - y.score);
     for (const { u } of ranked) {
-      if (this.inflight >= MAX_INFLIGHT) break;
+      if (this.inflight >= max) break;
       if (u.state !== "pending") continue; // taken by a group already
       const group = this.groupFor(u);
       if (group.length > 1) this.runGroup(group);
@@ -982,6 +1020,7 @@ export class PageTranslator {
    */
   private regroup(): void {
     this.groupsStale = false;
+    this.groupBudget = groupTokens(this.engineBatch);
     const debug = DEBUG();
     // hidden labels (icon buttons) are grouped among themselves: they are not part of the visible text around them
     for (const hidden of [false, true]) {
@@ -1002,7 +1041,7 @@ export class PageTranslator {
         return n;
       };
       for (const { u } of units) nodeOf(u.outer).children!.push({ item: u, cost: u.cost });
-      for (const group of packGroups(root, groupTokens(), GROUP_SIZE)) {
+      for (const group of packGroups(root, this.groupBudget, GROUP_SIZE)) {
         for (const u of group) {
           u.group = group;
           if (debug && u.level.parent.nodeType === Node.ELEMENT_NODE) (u.level.parent as HTMLElement).dataset.plamoGroup = String(group[0].order);

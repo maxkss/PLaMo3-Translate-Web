@@ -108,7 +108,7 @@ worker.onmessage = (ev: MessageEvent<WorkerOut>) => {
       loaded = true;
       activeModel = m.model;
       engineBatch = m.batch;
-      setStatus({ state: "ready", model: m.model, backend: m.backend, tokensPerSec: undefined, message: `준비됨 (${MODELS[m.model].label} · ${m.backend}, ${(m.ms / 1000).toFixed(1)}s)` });
+      setStatus({ state: "ready", model: m.model, backend: m.backend, batch: m.batch, tokensPerSec: undefined, message: `준비됨 (${MODELS[m.model].label} · ${m.backend}, ${(m.ms / 1000).toFixed(1)}s)` });
       loading?.resolve();
       loading = null;
       void armIdle();
@@ -151,7 +151,7 @@ async function ensureLoaded(): Promise<void> {
   const promise = new Promise<void>((res, rej) => ((resolve = res), (reject = rej)));
   loading = { promise, resolve, reject };
   const gen = loadGen;
-  const { backend, model } = await getSettings();
+  const { backend, model, batchSize } = await getSettings();
   const info = MODELS[model] ?? MODELS["0.8b"];
   if (!(await installedModels()).includes(info.id)) {
     if (loading?.promise === promise) loading = null;
@@ -162,7 +162,7 @@ async function ensureLoaded(): Promise<void> {
   if (gen !== loadGen) return promise; // unloaded meanwhile; promise is already rejected
   activeModel = info.id;
   setStatus({ state: "loading", model: info.id, progress: undefined, message: `${info.label} 모델 불러오는 중…` });
-  toWorker({ t: "load", gen, model: info.id, backend, extBase: chrome.runtime.getURL("") });
+  toWorker({ t: "load", gen, model: info.id, backend, extBase: chrome.runtime.getURL(""), batch: batchSize });
   return promise;
 }
 
@@ -207,6 +207,8 @@ interface Job {
   seq: number;
   /** aborted to make room for a more urgent job; goes back into the queue */
   preempted?: boolean;
+  /** aborted because nobody waits for it any more; new requests start a job of their own instead of joining it */
+  dropped?: boolean;
   /** latest partial text, sent to subscribers that join mid-way */
   partial?: string;
   /** sent to the worker as interactive (decoded ahead of background jobs) */
@@ -260,7 +262,7 @@ function enqueue(req: TranslateRequest, port: chrome.runtime.Port): void {
     return;
   }
   const sub: Sub = { id: req.id, port, stream: !!req.stream, priority: req.priority ?? 10 };
-  const same = [...running].find((j) => j.key === key && !j.preempted) ?? queue.find((j) => j.key === key);
+  const same = [...running].find((j) => j.key === key && !j.preempted && !j.dropped) ?? queue.find((j) => j.key === key);
   if (same) {
     same.subs.push(sub);
     if (sub.stream && same.partial) safePost(port, { type: "delta", id: sub.id, text: same.partial });
@@ -281,7 +283,10 @@ function cancel(port: chrome.runtime.Port, ids?: string[], all?: boolean): void 
   }
   for (const r of running) {
     r.subs = r.subs.filter((s) => !match(s));
-    if (!r.subs.length) r.abort.abort();
+    if (!r.subs.length && !r.dropped) {
+      r.dropped = true;
+      r.abort.abort();
+    }
   }
 }
 
@@ -327,11 +332,13 @@ async function runJob(job: Job): Promise<void> {
     for (const s of job.subs) safePost(s.port, { type: "done", id: s.id, text });
   } catch (e) {
     const live = job.subs.filter((s) => ports.has(s.port));
-    if (job.preempted && live.length) {
-      // restart later from the beginning (its partial output is discarded)
-      queue.push({ ...job, subs: live, abort: new AbortController(), preempted: false, partial: undefined });
+    const aborted = (e as Error)?.name === "AbortError";
+    if (aborted && live.length) {
+      // preempted, or someone still waits for it: restart later from the beginning (its partial output is discarded).
+      // An aborted job must not end with subscribers left waiting: they would never hear back.
+      queue.push({ ...job, subs: live, abort: new AbortController(), preempted: false, dropped: false, partial: undefined });
       sortQueue();
-    } else if ((e as Error)?.name !== "AbortError") {
+    } else if (!aborted) {
       for (const s of job.subs) safePost(s.port, { type: "error", id: s.id, message: String((e as Error)?.message ?? e) });
     }
   } finally {

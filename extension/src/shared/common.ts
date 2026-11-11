@@ -82,6 +82,41 @@ export interface Settings {
   backend: Backend;
   /** Unload the models after this many minutes without work (0 = keep them loaded). */
   idleUnloadMin: number;
+  /** Translations decoded together on the GPU (one of BATCH_CHOICES; recommendedBatch suggests one). */
+  batchSize: number;
+}
+
+/** Choices for Settings.batchSize. */
+export const BATCH_CHOICES = [1, 2, 3, 4, 6, 8, 12, 16];
+/**
+ * The largest batch that gives exactly the same tokens as translating one at a time (measured on 0.8B; wider batches
+ * pick other GPU kernels and change a word here and there: 12 of 16 paragraphs identical at 8 and 16).
+ */
+export const EXACT_BATCH = 3;
+/** Capacity of the static KV buffers in tokens (engine/generator.ts; >= its MAX_CONTEXT). */
+export const KV_CAPACITY = 2048;
+/** GPU memory the batch KV buffers should stay within (all rows together), for the recommendation. */
+const BATCH_KV_BUDGET = 512 * 1024 * 1024;
+
+/** KV buffers of one sequence: key and value per layer, [heads, KV_CAPACITY, headDim] fp16. */
+export const kvBytesPerRow = (m: ModelInfo) => m.numLayers * 2 * m.numKvHeads * KV_CAPACITY * m.headDim * 2;
+
+/**
+ * The batch size to suggest, and why. Without a GPU translations run one at a time. NVIDIA GPUs: 16 (measured on an
+ * RTX 3070 with 0.8B: a 44-paragraph page 3× faster than with 3); other GPUs: 4, as 16 was not measured on them. Either
+ * way no more rows than fit BATCH_KV_BUDGET of KV buffers (0.8B: 16 MB per row, 2B: 96 MB).
+ * `vendor`: the WebGPU adapter's vendor, null without WebGPU.
+ */
+export function recommendedBatch(vendor: string | null, m: ModelInfo): { size: number; reason: string } {
+  if (vendor === null) return { size: 1, reason: "GPU를 쓸 수 없어 한 번에 하나씩 번역합니다" };
+  const nvidia = /nvidia/i.test(vendor);
+  const fit = Math.floor(BATCH_KV_BUDGET / kvBytesPerRow(m));
+  const want = nvidia ? 16 : 4;
+  // the largest of the choices that fits
+  const size = Math.max(...BATCH_CHOICES.filter((n) => n === 1 || n <= Math.min(want, fit)));
+  const gpu = nvidia ? "NVIDIA GPU" : "NVIDIA 외 GPU";
+  if (fit < want) return { size, reason: `${gpu} · ${m.label}는 문단당 KV 메모리가 ${Math.round(kvBytesPerRow(m) / 2 ** 20)} MB라 ${size}개까지` };
+  return { size, reason: nvidia ? `${gpu} · ${m.label}` : `${gpu}에서는 16개를 측정하지 않았습니다` };
 }
 
 /** Choices for Settings.idleUnloadMin. */
@@ -107,6 +142,8 @@ export const DEFAULT_SETTINGS: Settings = {
   modelUrlOverride: "",
   backend: "auto",
   idleUnloadMin: 5,
+  // one more than EXACT_BATCH (a word may differ now and then); the settings suggest a width for the GPU (recommendedBatch)
+  batchSize: 4,
 };
 
 export async function getSettings(): Promise<Settings> {
@@ -261,6 +298,8 @@ export interface EngineStatus {
   /** decode speed of the last job */
   tokensPerSec?: number;
   queue?: number;
+  /** how many translations the loaded engine decodes together (clients keep about that many requests in flight) */
+  batch?: number;
 }
 
 /** Port name used by content scripts / extension pages to talk to the offscreen engine. */

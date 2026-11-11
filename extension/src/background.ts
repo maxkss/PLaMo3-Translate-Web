@@ -90,10 +90,13 @@ function setTabActive(tabId: number, active: boolean): Promise<unknown> {
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => void setTabActive(tabId, false));
-// a link opened in a new tab from a translated page carries the translation along
-chrome.tabs.onCreated.addListener(async (tab) => {
-  if (tab.id == null || tab.openerTabId == null) return;
-  if ((await activeTabs()).includes(tab.openerTabId)) void setTabActive(tab.id, true);
+// a link opened in a new tab from a translated page carries the translation along. Not tabs.onCreated: Chrome also
+// sets openerTabId on tabs opened from the browser's UI (Ctrl+T, the + button, bookmarks), which are unrelated pages.
+chrome.webNavigation.onCreatedNavigationTarget.addListener(({ sourceTabId, tabId }) => {
+  tabsLock = tabsLock.then(async () => {
+    const tabs = await activeTabs();
+    if (tabs.includes(sourceTabId) && !tabs.includes(tabId)) await chrome.storage.session.set({ [ACTIVE_TABS]: [...tabs, tabId] });
+  }).catch(() => {});
 });
 
 chrome.runtime.onMessage.addListener((msg: BackgroundMessage, sender, sendResponse) => {
