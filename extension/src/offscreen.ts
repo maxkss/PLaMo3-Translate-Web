@@ -225,7 +225,7 @@ const isInteractive = (j: Job) => prio(j) <= 0;
 const sortQueue = () => queue.sort((a, b) => prio(a) - prio(b) || a.seq - b.seq);
 let seq = 0;
 const cache = new Map<string, string>();
-const cacheKey = (r: TranslateInput) => `${activeModel}\u0001${r.targetLang}\u0001${r.sourceLang ?? ""}\u0001${r.context ?? ""}\u0001${r.text}`;
+const cacheKey = (r: TranslateInput) => `${activeModel}\u0001${r.targetLang}\u0001${r.sourceLang ?? ""}\u0001${r.context ?? ""}\u0001${r.form ?? ""}\u0001${r.text}`;
 
 /**
  * With batching, the worker decodes several background jobs together (one more is sent than fits, so a freed row is
@@ -267,8 +267,8 @@ function enqueue(req: TranslateRequest, port: chrome.runtime.Port): void {
     same.subs.push(sub);
     if (sub.stream && same.partial) safePost(port, { type: "delta", id: sub.id, text: same.partial });
   } else {
-    const { text, targetLang, sourceLang, context } = req;
-    queue.push({ key, input: { text, targetLang, sourceLang, context }, subs: [sub], abort: new AbortController(), seq: seq++ });
+    const { text, targetLang, sourceLang, context, form } = req;
+    queue.push({ key, input: { text, targetLang, sourceLang, context, form }, subs: [sub], abort: new AbortController(), seq: seq++ });
   }
   sortQueue();
   preemptIfNeeded();

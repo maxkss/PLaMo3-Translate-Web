@@ -312,9 +312,39 @@ export interface TranslateRequest {
   targetLang: string;
   sourceLang?: string | null;
   context?: string | null;
+  /**
+   * Sentence style of the translation (FORM_LANGS only): unset, the model picks one per request, and the paragraphs of
+   * a page come out in either. A page decides it once (content/page.ts).
+   */
+  form?: TextForm | null;
   /** lower = sooner */
   priority?: number;
   stream?: boolean;
+}
+
+/** Korean -다 / -습니다·-요, Japanese だ・である / です・ます. */
+export type TextForm = "plain" | "polite";
+/** Target languages with a TextForm. */
+export const FORM_LANGS = new Set(["ko", "ja"]);
+
+const FORM_ENDINGS: Record<string, { polite: RegExp; plain: RegExp }> = {
+  ko: { polite: /(니다|니까|요)$/u, plain: /[다라자냐]$/u },
+  ja: { polite: /(です|ます|でした|ました|ません|ましょう|でしょう|ください)$/u, plain: /(だ|である|た|ない|る|う|い|か)$/u },
+};
+
+/** The style most sentences of `text` (a translation into `lang`) end in; null when none of them tells. */
+export function textForm(text: string, lang: string): TextForm | null {
+  const end = FORM_ENDINGS[lang];
+  if (!end) return null;
+  let polite = 0;
+  let plain = 0;
+  for (const s of text.split(/(?<=[.!?。！？])\s*|\n+/u)) {
+    // without the closing punctuation, quotes, brackets and footnote marks ([2])
+    const t = s.replace(/(\[\d+\]|[\s.!?。！？"'”’」』)\]])+$/u, "");
+    if (end.polite.test(t)) polite++;
+    else if (end.plain.test(t)) plain++;
+  }
+  return polite + plain === 0 ? null : polite > plain ? "polite" : "plain";
 }
 
 /** Image translation: OCR of one image. Coordinates are in the image's natural pixels. */

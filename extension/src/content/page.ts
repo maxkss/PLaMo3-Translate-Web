@@ -14,7 +14,7 @@
  * the viewport; dynamic content is picked up through a MutationObserver.
  */
 
-import type { DisplayMode } from "../shared/common.ts";
+import { FORM_LANGS, textForm, type DisplayMode, type TextForm } from "../shared/common.ts";
 import type { EngineClient } from "../shared/client.ts";
 
 /** subtrees never looked into */
@@ -82,6 +82,17 @@ const groupTokens = (engineBatch: number) => {
   const v = Number(document.documentElement.dataset.plamoGroupTokens);
   return Number.isFinite(v) && v > 0 ? v : engineBatch >= 8 ? WIDE_GROUP_TOKENS : GROUP_TOKENS;
 };
+/**
+ * Text with sentences (it has sentence punctuation and some length), whose translation has sentence endings that must
+ * agree across the page — not a label, a menu item or a heading.
+ */
+export function isProse(text: string): boolean {
+  if (!/[.!?。！？](?=["'”’)\]]*(\s|$))/u.test(text)) return false;
+  let letters = 0;
+  for (const ch of text) if (/\p{L}/u.test(ch)) letters += /[\p{Script=Han}\p{Script=Hangul}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(ch) ? 3 : 1;
+  return letters >= 40;
+}
+
 /** landmarks and widgets: a group never crosses their boundary, however small they are */
 const HARD = [
   "header", "nav", "main", "aside", "footer", "form", "dialog",
@@ -472,6 +483,17 @@ export class PageTranslator {
   /** running transition animations (cancelled on stop) */
   private anims = new Set<Animation>();
   private target = "ko";
+  /**
+   * The sentence style of this page's translations (TranslateRequest.form), sent with every request once known:
+   * without it the style changes from request to request (a Wikipedia article: 57 of 258 sentences in -습니다, the
+   * rest in -다, a paragraph or a group at a time). It is the style the first prose came out in.
+   */
+  private form: TextForm | null = null;
+  /** the language `form` is for */
+  private formLang = "";
+  /** the first prose request runs before the form is known, and other prose waits for it; once (when its translation
+   * does not tell, the next finished prose that does decides) */
+  private probe: "none" | "running" | "done" = "none";
   private mode: DisplayMode = "replace";
   onProgress: (p: PageProgress) => void = () => {};
   onError: (msg: string) => void = () => {};
@@ -491,6 +513,9 @@ export class PageTranslator {
     if (this.active) this.stop();
     this.active = true;
     this.target = target;
+    if (target !== this.formLang) this.form = null;
+    this.formLang = target;
+    if (this.probe === "running") this.probe = "none";
     this.mode = mode;
     window.addEventListener("scroll", this.onScroll, { passive: true, capture: true });
     window.addEventListener("resize", this.onScroll, { passive: true });
@@ -1009,8 +1034,13 @@ export class PageTranslator {
       if (this.inflight >= max) break;
       if (u.state !== "pending") continue; // taken by a group already
       const group = this.groupFor(u);
-      if (group.length > 1) this.runGroup(group);
-      else this.run(u);
+      // the first prose decides the style of the page (form): the rest waits for it. Labels and menus go meanwhile;
+      // they have no sentence endings to agree on.
+      const first = FORM_LANGS.has(this.target) && !this.form && this.probe !== "done" && group.some((v) => isProse(v.text));
+      if (first && this.probe === "running") continue;
+      if (first) this.probe = "running";
+      if (group.length > 1) this.runGroup(group, first);
+      else this.run(u, first);
     }
   }
 
@@ -1064,7 +1094,7 @@ export class PageTranslator {
 
   /** Translate several units in one request, one line each; when the lines do not come back one per unit, each is
    * queued again on its own. */
-  private runGroup(units: Unit[]): void {
+  private runGroup(units: Unit[], probe = false): void {
     const id = this.client.newId();
     const batch: Batch = { id, members: new Set(units) };
     // each unit's numbered tags shifted so they are unique within the request
@@ -1085,7 +1115,7 @@ export class PageTranslator {
     this.inflight++;
     const live = (u: Unit) => this.active && this.units.includes(u) && batch.members.has(u);
     this.client
-      .translate({ id, text: lines.join("\n"), targetLang: this.target, context: document.title || null, priority: 5 })
+      .translate({ id, text: lines.join("\n"), targetLang: this.target, context: document.title || null, form: this.form, priority: 5 })
       .then(
         (tr) => {
           const out = tr.split(/\n+/).map((l) => l.trim()).filter(Boolean);
@@ -1117,6 +1147,7 @@ export class PageTranslator {
             this.mark(u);
             this.toPaint.add(u);
           });
+          this.learn(units.map((u, i) => ({ u, target: out[i] })));
           this.schedulePaint();
         },
         (e: Error) => {
@@ -1130,13 +1161,21 @@ export class PageTranslator {
         },
       )
       .finally(() => {
+        if (probe) this.probe = "done";
         if (batch.members.size || !this.active) this.inflight = Math.max(0, this.inflight - 1);
         this.report();
         this.pump();
       });
   }
 
-  private run(u: Unit): void {
+  /** The page's form, from the prose of a finished request, when it is not known yet. */
+  private learn(done: { u: Unit; target: string }[]): void {
+    if (this.form || !this.active || !FORM_LANGS.has(this.target)) return;
+    const prose = done.filter(({ u }) => isProse(u.text)).map(({ target }) => target.replace(/<\/?[a-z]+\d+\s*\/?>/gi, ""));
+    this.form = textForm(prose.join("\n"), this.target);
+  }
+
+  private run(u: Unit, probe = false): void {
     u.state = "running";
     this.mark(u);
     this.inflight++;
@@ -1144,7 +1183,7 @@ export class PageTranslator {
     const live = () => this.active && this.units.includes(u);
     // no streaming: a unit appears once its translation is complete
     this.client
-      .translate({ id, text: u.source, targetLang: this.target, context: document.title || null, priority: 5 })
+      .translate({ id, text: u.source, targetLang: this.target, context: document.title || null, form: this.form, priority: 5 })
       .then(
         (tr) => {
           if (!live()) return;
@@ -1152,6 +1191,7 @@ export class PageTranslator {
           u.translation = tr;
           this.mark(u);
           this.toPaint.add(u);
+          this.learn([{ u, target: tr }]);
           this.schedulePaint();
         },
         (e: Error) => {
@@ -1161,6 +1201,7 @@ export class PageTranslator {
         },
       )
       .finally(() => {
+        if (probe) this.probe = "done";
         if (live() || !this.active) this.inflight = Math.max(0, this.inflight - 1);
         this.report();
         this.pump();

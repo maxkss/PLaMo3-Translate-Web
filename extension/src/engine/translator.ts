@@ -1,4 +1,5 @@
 import { Generator, MAX_CONTEXT } from "./generator.ts";
+import type { TextForm } from "../shared/common.ts";
 import { buildPrompt } from "./prompt.ts";
 import { PlamoTokenizer, StreamDecoder } from "./tokenizer.ts";
 
@@ -7,6 +8,8 @@ export interface TranslateInput {
   targetLang: string;
   sourceLang?: string | null;
   context?: string | null;
+  /** sentence style (see TranslateRequest.form) */
+  form?: TextForm | null;
 }
 
 export interface TranslateStats {
@@ -48,7 +51,7 @@ export class Translator {
   }
 
   cacheKey(i: TranslateInput): string {
-    return `${i.targetLang}\u0001${i.sourceLang ?? ""}\u0001${i.context ?? ""}\u0001${i.text}`;
+    return `${i.targetLang}\u0001${i.sourceLang ?? ""}\u0001${i.context ?? ""}\u0001${i.form ?? ""}\u0001${i.text}`;
   }
 
   cached(i: TranslateInput): string | undefined {
