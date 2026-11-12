@@ -21,10 +21,12 @@ export function profileDir(prefix = "plamo-", { reuse = false } = {}) {
 }
 
 export async function launch({ size = "2b", headed = false, viewport = { width: 1280, height: 900 } } = {}) {
-  const dist = resolve("dist");
+  // DIST=<dir> loads another build of the extension (e.g. a baseline to compare against)
+  const dist = resolve(process.env.DIST ?? "dist");
   const profile = profileDir("plamo-", { reuse: true });
   const ctx = await chromium.launchPersistentContext(profile, {
-    channel: "chromium",
+    // CHROME=<chrome.exe> runs another Chromium build than Playwright's own
+    ...(process.env.CHROME ? { executablePath: process.env.CHROME } : { channel: "chromium" }),
     headless: !headed,
     viewport,
     args: [`--disable-extensions-except=${dist}`, `--load-extension=${dist}`, "--enable-unsafe-webgpu"],

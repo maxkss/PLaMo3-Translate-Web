@@ -6,16 +6,9 @@
 import * as ort from "onnxruntime-web/webgpu";
 import { INPAINT_MODEL, OCR_MODELS, type ErasePatch, type OcrModelId, type OcrResult } from "../shared/common.ts";
 import { getStoredFiles } from "../engine/storage.ts";
-import { skipParagraph } from "../shared/skip.ts";
-import { encodePatch, inpaintFill, markText, patchRect, pushPull, type Rect } from "./erase.ts";
-import { detect, drawColours, freeRoom, group, inkBand, inkRatio, inkSpan, measure, recognize, sideBackgrounds, type Pixels } from "./ocr.ts";
-
-/**
- * Background noise (80th percentile distance from its median colour) above which it counts as busy, and the stroke
- * score (thickness against a regular face's at that size) above which text counts as bold.
- */
-const BUSY_NOISE = 28;
-const BOLD_SCORE = 1.2;
+import { describe, planErase } from "./analyse.ts";
+import { encodePatch, inpaintFill, pushPull, type Rect } from "./erase.ts";
+import { detect, recognize, type Pixels } from "./ocr.ts";
 
 export type OcrWorkerIn =
   | { t: "ocr"; job: number; image: ImageBitmap; extBase: string; targetLang: string; model: OcrModelId }
@@ -27,7 +20,6 @@ export type OcrWorkerOut =
   | { t: "patches"; job: number; patches: ErasePatch[] }
   | { t: "error"; job: number; message: string };
 
-const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)] ?? 0;
 const post = (m: OcrWorkerOut, transfer: Transferable[] = []) => (self as unknown as Worker).postMessage(m, transfer);
 
 interface Sessions {
@@ -40,7 +32,7 @@ let sessions: Promise<Sessions> | null = null;
 let sessionsModel: OcrModelId | null = null;
 let inpaintSession: Promise<ort.InferenceSession> | null = null;
 /** the last images' pixels and erase masks, for the inpainting pass that follows OCR */
-const erasing = new Map<number, { px: Pixels; mask: Uint8Array; k: number; pending: { i: number; rect: Rect }[] }>();
+const erasing = new Map<number, { px: Pixels; mask: Uint8Array; owner: Int16Array; k: number; pending: { i: number; rect: Rect }[] }>();
 
 /**
  * Sessions (and the cached pixels) are released after a minute without work, so the models do not stay in memory
@@ -134,7 +126,7 @@ async function runInpaint(job: number): Promise<ErasePatch[]> {
   for (const { i, rect } of st.pending) {
     // too much text to reconstruct: the overlay keeps its blurred fill there
     if (!(await inpaintFill(ort, session, st.px, st.mask, rect))) continue;
-    patches.push({ i, rect: rect.map((v) => v * st.k) as Rect, url: await encodePatch(st.px, rect) });
+    patches.push({ i, rect: rect.map((v) => v * st.k) as Rect, url: await encodePatch(st.px, rect, st.owner, i) });
   }
   st.pending = [];
   return patches;
@@ -158,88 +150,19 @@ async function run(job: number, image: ImageBitmap, extBase: string, targetLang:
   const lines = await recognize(ort, s.rec, s.dict, px, boxes);
   const tRec = performance.now();
   const k = 1 / scale;
-  const sc = (b: [number, number, number, number]): [number, number, number, number] => [b[0] * k, b[1] * k, b[2] * k, b[3] * k];
-  const styled = lines.map((l) => {
-    const style = measure(px, [l.box]);
-    const vertical = l.box[3] >= l.box[2] * 1.5 && l.text.length >= 2;
-    const ink = inkBand(px, l.box, vertical, style);
-    return { ...l, style, ink, span: inkSpan(px, l.box, vertical, ink, style) };
-  });
-  const groups = group(styled);
-  const paragraphs = groups.map((p) => {
-    const style = measure(px, p.lines.map((l) => l.box));
-    // font size from the ink band of each line (the detector box height depends on its aspect ratio)
-    const fontPx = median(p.lines.map((l) => (l.ink ? l.ink[1] - l.ink[0] : p.lineSize * 0.8))) / inkRatio(p.text);
-    // rectangle covered by the glyph ink: lines' bands across, spans along
-    const across = p.lines.flatMap((l) => l.ink ?? []), along = p.lines.flatMap((l) => l.span ?? []);
-    const a0 = Math.min(...across), a1 = Math.max(...across), t0 = Math.min(...along), t1 = Math.max(...along);
-    const inkBox: [number, number, number, number] = p.vertical ? [a0, t0, a1 - a0, t1 - t0] : [t0, a0, t1 - t0, a1 - a0];
-    const room = freeRoom(px, inkBox, style.bg, Math.max(px.width, px.height), Math.max(2, Math.round(fontPx * 0.12)));
-    // stroke thickness against what a regular face has at this size: about 0.062 × ink height, plus ~0.55 px of
-    // antialiasing blur (which matters for small text); bold faces come out ~1.3× or more
-    const inkH = fontPx * 0.93;
-    const boldScore = style.stroke / (0.55 + 0.062 * inkH);
-    const busy = style.noise > BUSY_NOISE;
-    // a gradient: each side uniform, the colour changing across the text
-    let gradient: OcrResult["paragraphs"][number]["gradient"];
-    if (busy) {
-      const [l, r, t, b] = sideBackgrounds(px, inkBox, Math.max(2, fontPx * 0.2));
-      if (Math.max(l.noise, r.noise, t.noise, b.noise) < BUSY_NOISE) {
-        const dist = (a: number[], c: number[]) => Math.hypot(a[0] - c[0], a[1] - c[1], a[2] - c[2]);
-        gradient = dist(l.colour, r.colour) >= dist(t.colour, b.colour) ? { to: "right", from: l.colour, end: r.colour } : { to: "bottom", from: t.colour, end: b.colour };
-      }
-    }
-    return {
-      ...p,
-      ...drawColours(style),
-      busy,
-      gradient,
-      bold: boldScore > BOLD_SCORE,
-      room: room.map((r) => r * k) as [number, number, number, number],
-      inkBox: sc(inkBox),
-      noise: Math.round(style.noise),
-      ink: Math.round(boldScore * 100) / 100,
-      box: sc(p.box),
-      lineSize: p.lineSize * k,
-      fontPx: fontPx * k,
-      lines: p.lines.map(({ box, text, score, ink, span }) => ({
-        box: sc(box),
-        text,
-        score,
-        ink: ink && ([ink[0] * k, ink[1] * k] as [number, number]),
-        span: span && ([span[0] * k, span[1] * k] as [number, number]),
-      })),
-    };
-  });
+  const paragraphs = describe(px, lines, k);
   const tLayout = performance.now();
-  // erase the text that will be translated: push-pull now for plain/gradient backgrounds, inpainting later for photos
-  const mask = new Uint8Array(px.width * px.height);
-  const plain: { i: number; rect: Rect; fontPx: number }[] = [];
-  const pending: { i: number; rect: Rect }[] = [];
-  // text left untranslated is still erased where a translated paragraph's area overlaps it (a "40%" inside a
-  // translated headline would otherwise show through the translation)
-  const translated = paragraphs.map((p) => !skipParagraph(p, targetLang, height));
-  const areas = paragraphs.map((p) => {
-    const g = p.fontPx * 0.5;
-    return [p.inkBox[0] - g, p.inkBox[1] - g, p.inkBox[2] + 2 * g, p.inkBox[3] + 2 * g];
-  });
-  const overlaps = (a: number[], b: number[]) => a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3];
-  paragraphs.forEach((p, i) => {
-    if (!translated[i] && !paragraphs.some((_, j) => translated[j] && j !== i && overlaps(areas[i], areas[j]))) return;
-    // back to the pixels the OCR read (the result is in the image's natural size)
-    const pp = { inkBox: p.inkBox.map((v) => v / k) as Rect, fontPx: p.fontPx / k, bg: p.bg, fg: p.fg };
-    const photo = p.busy && !p.gradient;
-    markText(px, mask, pp, photo);
-    if (photo) pending.push({ i, rect: patchRect(px, pp) });
-    else plain.push({ i, rect: patchRect(px, pp), fontPx: pp.fontPx });
-  });
+  // erase the text that will be translated: diffusion now wherever the hole is only the glyphs, the inpainting model
+  // later for whole boxes on photos
+  const { mask, owner, thin: plain, box: pending } = planErase(px, paragraphs, k, targetLang, height);
+
   const patches: ErasePatch[] = [];
   for (const { i, rect, fontPx } of plain) {
     pushPull(px, mask, rect, Math.max(8, Math.round(1.5 * fontPx)));
-    patches.push({ i, rect: rect.map((v) => v * k) as Rect, url: await encodePatch(px, rect) });
+    patches.push({ i, rect: rect.map((v) => v * k) as Rect, url: await encodePatch(px, rect, owner, i) });
   }
   if (pending.length) {
-    erasing.set(job, { px, mask, k, pending });
+    erasing.set(job, { px, mask, owner, k, pending });
     // keep the two most recent images only
     for (const key of [...erasing.keys()].slice(0, -2)) erasing.delete(key);
   }

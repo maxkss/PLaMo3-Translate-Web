@@ -402,6 +402,8 @@ export interface OcrParagraph {
   gradient?: { to: "right" | "bottom"; from: Rgb; end: Rgb };
   /** the text looks bold */
   bold: boolean;
+  /** letter-spacing added to the face's own, in em (0 for normally set text; wide-tracked capitals reach 0.3–1) */
+  tracking?: number;
   /** rectangle covered by the glyph ink (x, y, w, h) */
   inkBox: [number, number, number, number];
   /** plain background around the ink rectangle — left, right, up, down (image pixels): room for a longer translation */

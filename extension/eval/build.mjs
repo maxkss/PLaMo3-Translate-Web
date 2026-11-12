@@ -25,11 +25,14 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), "data");
 const args = process.argv.slice(2);
+// --holdout: other images of the same sources, into eval/holdout/ — never looked at while changing the code, to tell
+// a rule that generalises from one fitted to the images it was tuned on
+const HOLD = args.includes("--holdout");
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), HOLD ? "holdout" : "data");
 const only = args.find((a) => a.startsWith("--sets="))?.slice(7).split(",");
 const nArg = Number(args.find((a) => a.startsWith("--n="))?.slice(4) ?? 0);
-const DEFAULT_N = { cagui: 400, hiertext: 80, openmantra: 60, vistra: 100, websight: 40 };
+const DEFAULT_N = { cagui: 400, hiertext: 80, openmantra: 60, vistra: 100, websight: 40, crello: 80 };
 const n = (set) => nArg || DEFAULT_N[set];
 const log = (...a) => console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...a);
 
@@ -119,7 +122,7 @@ const SETS = {
     prepare(set);
     const base = "https://huggingface.co/datasets/openbmb/CAGUI/resolve/main/CAGUI_grounding";
     const lines = (await get(`${base}/code/ocr.jsonl`, "text")).trim().split("\n").map((l) => JSON.parse(l));
-    const rows = await pool(lines.slice(0, n(set)), 8, async (r) => {
+    const rows = await pool(lines.slice(HOLD ? 400 : 0, (HOLD ? 400 : 0) + n(set)), 8, async (r) => {
       const name = r.image.split("/").pop();
       const buf = await get(`${base}/images/ocr/${name}`);
       writeFileSync(join(ROOT, set, "images", name), buf);
@@ -152,10 +155,13 @@ const SETS = {
     // the images: HierText's own archive of Open Images (577 MB), streamed and read only until enough are found
     const want = new Map(picks.map((a) => [a.image_id, a]));
     const rows = [];
+    let skipped = 0;
     for await (const { name, data } of tarEntries("https://open-images-dataset.s3.amazonaws.com/ocr/validation.tgz")) {
       const id = name.split("/").pop().replace(/\.jpg$/, "");
       const a = want.get(id);
       if (!a) continue;
+      // the hold-out set starts after the 80 images of the main one
+      if (HOLD && ++skipped <= 80) continue;
       const [width, height] = imageSize(data);
       const sx = width / a.image_width, sy = height / a.image_height;
       const scale = (b) => [b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy].map((v) => Math.round(v));
@@ -185,7 +191,7 @@ const SETS = {
     const picks = books.flatMap((b) => {
       const ps = pages.filter((p) => p.book === b.book_title && p.text.length);
       const step = Math.max(1, Math.floor(ps.length / per));
-      return ps.filter((_, i) => i % step === 0).slice(0, per);
+      return ps.filter((_, i) => i % step === (HOLD ? step >> 1 : 0)).slice(0, per);
     });
     const rows = await pool(picks.slice(0, n(set)), 6, async (p) => {
       const path = p.image_paths.ja;
@@ -208,7 +214,7 @@ const SETS = {
     const base = "https://raw.githubusercontent.com/esalesky/vistra-benchmark/main";
     const list = await get("https://api.github.com/repos/esalesky/vistra-benchmark/contents/annotations", "json");
     const step = Math.max(1, Math.floor(list.length / n(set)));
-    const picks = list.filter((_, i) => i % step === 0).slice(0, n(set));
+    const picks = list.filter((_, i) => i % step === (HOLD ? step >> 1 : 0)).slice(0, n(set));
     const rows = await pool(picks, 8, async (f) => {
       const a = await get(`${base}/annotations/${f.name}`, "json");
       const buf = await get(`${base}/images/${a.image_file}`);
@@ -229,7 +235,7 @@ const SETS = {
     const browser = await chromium.launch();
     const page = await browser.newPage({ viewport: { width: 1024, height: 900 } });
     const rows = [];
-    for (let offset = 0; rows.length < n(set); offset += 20) {
+    for (let offset = HOLD ? 3000 : 0; rows.length < n(set); offset += 20) {
       const data = await get(`https://datasets-server.huggingface.co/rows?dataset=HuggingFaceM4/WebSight&config=v0.1&split=train&offset=${offset}&length=20`, "json");
       for (const { row_idx, row } of data.rows) {
         if (rows.length >= n(set)) break;
@@ -283,6 +289,141 @@ const SETS = {
       }
     }
     await browser.close();
+    writeSet(set, rows);
+  },
+
+  /**
+   * Designed graphics — posters, flyers, social-media posts, banners — from Crello's layered templates. Every element
+   * comes as its own image, so each template is composited here twice: with its text (images/) and without it
+   * (clean/, the exact background an eraser should restore). masks/ holds the text's own pixels (its alpha), and
+   * every text element carries its font size, alignment, colour and line count.
+   */
+  async crello() {
+    const set = "crello";
+    prepare(set);
+    for (const d of ["clean", "masks"]) mkdirSync(join(ROOT, set, d), { recursive: true });
+    const api = "https://datasets-server.huggingface.co";
+    const info = await get(`${api}/info?dataset=cyberagent/crello`, "json");
+    const f = info.dataset_info.default.features;
+    const FORMATS = f.format.names, FONTS = f.font[0].names, ALIGN = f.text_align[0].names, TYPES = f.type[0].names;
+    const split = HOLD ? "validation" : "test";
+    const total = info.dataset_info.default.splits[split].num_examples;
+    const browser = await chromium.launch();
+    const page = await browser.newPage();
+    const rows = [];
+    const perFormat = new Map();
+    // pages of 10 templates spread over the split; at most a fifth of the set from one format
+    const PAGE = 10, cap = Math.max(2, Math.ceil(n(set) / 5));
+    const offsets = Array.from({ length: Math.floor(total / PAGE) }, (_, k) => k * PAGE);
+    for (let k = 0, step = 7; rows.length < n(set) && k < offsets.length; k++) {
+      const offset = offsets[(k * step) % offsets.length];
+      let data;
+      try {
+        data = await get(`${api}/rows?dataset=cyberagent/crello&config=default&split=${split}&offset=${offset}&length=${PAGE}`, "json");
+      } catch (e) {
+        log("skip crello page", offset, String(e.message ?? e).slice(0, 80));
+        continue;
+      }
+      for (const { row } of data.rows) {
+        if (rows.length >= n(set)) break;
+        const format = FORMATS[row.format];
+        const texts = row.type.map((t, i) => (TYPES[t] === "TextElement" && row.text[i]?.trim() ? i : -1)).filter((i) => i >= 0);
+        // axis-aligned text only (the OCR has no rotated boxes), and enough of it to say something about layout
+        if (texts.length < 2 || texts.some((i) => Math.abs(row.angle[i]) > 0.5) || (perFormat.get(format) ?? 0) >= cap) continue;
+        if (Math.min(row.canvas_width, row.canvas_height) < 300) continue;
+        try {
+          const els = await pool(row.type.map((_, i) => i), 6, async (i) => {
+            const src = row.image[i]?.src;
+            if (!src) return null;
+            return { i, url: `data:image/png;base64,${(await get(src)).toString("base64")}` };
+          });
+          if (els.length !== row.type.length) continue; // an element failed to download: the composite would be wrong
+          els.sort((a, b) => a.i - b.i);
+          const scale = Math.min(1, 1600 / Math.max(row.canvas_width, row.canvas_height));
+          const out = await page.evaluate(async ({ els, row, texts, scale }) => {
+            const W = Math.round(row.canvas_width * scale), H = Math.round(row.canvas_height * scale);
+            const mk = () => {
+              const c = document.createElement("canvas");
+              c.width = W;
+              c.height = H;
+              return c;
+            };
+            const full = mk(), clean = mk(), mask = mk();
+            const draw = (c, bmp, i, opaque) => {
+              const g = c.getContext("2d");
+              g.save();
+              g.globalAlpha = opaque ? 1 : (row.opacity[i] ?? 1);
+              const x = row.left[i] * scale, y = row.top[i] * scale, w = row.width[i] * scale, h = row.height[i] * scale;
+              g.translate(x + w / 2, y + h / 2);
+              g.rotate(row.angle[i] ?? 0);
+              g.drawImage(bmp, -w / 2, -h / 2, w, h);
+              g.restore();
+            };
+            for (const c of [full, clean]) {
+              const g = c.getContext("2d");
+              g.fillStyle = "#fff";
+              g.fillRect(0, 0, W, H);
+            }
+            const inks = {};
+            for (const { i, url } of els) {
+              const bmp = await createImageBitmap(await (await fetch(url)).blob());
+              const isText = texts.includes(i);
+              draw(full, bmp, i);
+              if (!isText) {
+                draw(clean, bmp, i);
+                // an element drawn over text hides it: take it out of the mask too
+                const g = mask.getContext("2d");
+                g.save();
+                g.globalCompositeOperation = "destination-out";
+                draw(mask, bmp, i);
+                g.restore();
+                continue;
+              }
+              draw(mask, bmp, i);
+              // the text's own ink: bounding box of its alpha, and of each row of ink (lines)
+              const one = mk();
+              draw(one, bmp, i, true);
+              const d = one.getContext("2d").getImageData(0, 0, W, H).data;
+              let x0 = W, y0 = H, x1 = -1, y1 = -1;
+              for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+                if (d[(y * W + x) * 4 + 3] < 48) continue;
+                if (x < x0) x0 = x;
+                if (x > x1) x1 = x;
+                if (y < y0) y0 = y;
+                if (y > y1) y1 = y;
+              }
+              if (x1 >= 0) inks[i] = [x0, y0, x1 - x0 + 1, y1 - y0 + 1];
+            }
+            const png = (c) => c.toDataURL("image/png").split(",")[1];
+            return { W, H, full: png(full), clean: png(clean), mask: png(mask), inks };
+          }, { els, row, texts, scale });
+          const regions = [], styles = [];
+          for (const i of texts) {
+            const box = out.inks[i];
+            if (!box || box[2] < 4 || box[3] < 4) continue;
+            const text = row.text[i].replace(/\s*\n\s*/g, "\n").trim();
+            const nLines = row.text_line[i].length ? Math.max(...row.text_line[i]) + 1 : text.split("\n").length;
+            const fontSize = +(row.font_size[i] * scale).toFixed(2);
+            const bold = row.font_bold[i].filter(Boolean).length > row.font_bold[i].length / 2;
+            const color = row.text_color[i][0] ?? "";
+            const s = { box, text: row.capitalize[i] ? text.toUpperCase() : text, fontSize, fontWeight: bold ? 700 : 400, color, align: ALIGN[row.text_align[i]] || "left", lines: nLines || 1, font: FONTS[row.font[i]], key: `${fontSize}/${bold}/${color}` };
+            styles.push(s);
+            regions.push({ box, text: s.text, level: "element" });
+          }
+          if (regions.length < 2) continue;
+          const name = `${row.id}.png`;
+          writeFileSync(join(ROOT, set, "images", name), Buffer.from(out.full, "base64"));
+          writeFileSync(join(ROOT, set, "clean", name), Buffer.from(out.clean, "base64"));
+          writeFileSync(join(ROOT, set, "masks", name), Buffer.from(out.mask, "base64"));
+          perFormat.set(format, (perFormat.get(format) ?? 0) + 1);
+          rows.push({ id: `crello-${row.id}`, set, image: `images/${name}`, clean: `clean/${name}`, mask: `masks/${name}`, width: out.W, height: out.H, lang: "mixed", format, license: "CDLA-Permissive-2.0", source: `cyberagent/crello (${split})`, regions, styles });
+        } catch (e) {
+          log("skip crello", row.id, String(e.message ?? e).slice(0, 100));
+        }
+      }
+    }
+    await browser.close();
+    log("crello formats:", JSON.stringify(Object.fromEntries(perFormat)));
     writeSet(set, rows);
   },
 };

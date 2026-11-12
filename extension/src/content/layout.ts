@@ -72,7 +72,7 @@ function weightedMedian(items: { v: number; w: number }[]): number {
 /** Tolerance for "the same line/edge": two pixels, or 20% of the font size (glyph side bearings differ). */
 const tol = (em: number) => Math.max(2, 0.2 * em);
 
-export function inferLayout(ps: OcrParagraph[]): ParaLayout[] {
+export function inferLayout(ps: OcrParagraph[], size?: { width: number; height: number }): ParaLayout[] {
   const n = ps.length;
   // ---- 1. styles: sizes sorted per (orientation, weight); a style spans at most 12% from its smallest to its largest
   // member, so close sizes cannot chain a heading into body text. Its size is the members' weighted median.
@@ -142,9 +142,18 @@ export function inferLayout(ps: OcrParagraph[]): ParaLayout[] {
       };
       const many = p.lines.length > 2;
       const w = 2 * (p.lines.length - 1);
-      if (spread("start", many ? p.lines.slice(1) : p.lines) <= t * 1.5) support.set("start", support.get("start")! + w);
+      const start = spread("start", many ? p.lines.slice(1) : p.lines) <= t * 1.5;
+      const centre = spread("center", p.lines) <= t * 1.5;
+      // lines of about one width line up at their starts and at their centres alike: they tell nothing, and what is
+      // around the paragraph decides (a start-aligned reading would otherwise win every centred block of even lines)
+      if (start && centre) {
+        support.set("start", support.get("start")! + 1);
+        support.set("center", support.get("center")! + 1);
+        // a block sitting on the image's centre line was most likely centred there
+        if (size && !p.vertical && Math.abs(value(i, "center") - size.width / 2) <= t) support.set("center", support.get("center")! + 1);
+      } else if (start) support.set("start", support.get("start")! + w);
       else if (many && spread("end", p.lines.slice(0, -1)) <= t * 1.5) support.set("end", support.get("end")! + w);
-      else if (spread("center", p.lines) <= t * 1.5) support.set("center", support.get("center")! + w);
+      else if (centre) support.set("center", support.get("center")! + w);
     }
     // other paragraphs on other lines (stacked above/below, not beside) whose edge or centre lines up; one such
     // match can be a coincidence, so a kind needs at least two
@@ -187,9 +196,15 @@ export function inferLayout(ps: OcrParagraph[]): ParaLayout[] {
     // text tightly enclosed with even margins (a button, a chip, a tag): centred
     const [rl, rr] = p.vertical ? [p.room[2], p.room[3]] : [p.room[0], p.room[1]];
     if (rl < em(i) && rr < em(i) && Math.abs(rl - rr) <= 0.35 * (rl + rr) + 2) support.set("center", support.get("center")! + 3);
+    // as much free background on one side as on the other, up to whatever ends it (a panel's edges, the image's): set
+    // in the middle of its space. Weak evidence — two aligned neighbours outweigh it.
+    // (text that fills its space from edge to edge is not placed by its margins at all)
+    else if (!p.busy && Math.min(rl, rr) >= em(i) && rl + rr >= 0.5 * (ax[i].along[1] - ax[i].along[0]) && Math.abs(rl - rr) <= Math.max(t, 0.04 * (rl + rr))) support.set("center", support.get("center")! + 1.5);
     const best = Math.max(...support.values());
     const winners = KINDS.filter((k) => support.get(k) === best);
     if (best > 0 && winners.length === 1) return winners[0];
+    // even lines, nothing else to go by: where the block sits in the image
+    if (winners.includes("start") && winners.includes("center") && p.lines.length > 1 && size && !p.vertical && Math.abs(value(i, "center") - size.width / 2) <= t) return "center";
     if (best > 0 && winners.includes("start")) return "start";
     if (best > 0 && winners.includes("center")) return "center";
     // no evidence: start (reading direction)

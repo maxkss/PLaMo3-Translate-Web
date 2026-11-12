@@ -12,7 +12,7 @@ import type { OcrOutcome } from "../shared/client.ts";
 import type { ErasePatch, OcrParagraph, OcrResult } from "../shared/common.ts";
 import { FitGroup, fontMetrics, ParaView, type FontMetrics } from "./image-view.ts";
 import { axes, inferLayout } from "./layout.ts";
-import { skipParagraph } from "../shared/skip.ts";
+import { isList, reflow, textBlocks } from "../shared/blocks.ts";
 import { icon } from "../shared/icons.ts";
 
 /** The part of the drawn image the OCR result covers, as fractions (a screenshot may only cover the visible part). */
@@ -268,7 +268,8 @@ export class ImageTranslator {
    * text changing while it streams in).
    */
   private async render(o: Overlay, { result, morePatches }: OcrOutcome, targetLang: string): Promise<void> {
-    const todo = result.paragraphs.filter((p) => !skipParagraph(p, targetLang, result.height));
+    const { blocks, translate: wanted } = textBlocks(result.paragraphs, targetLang, result.height);
+    const todo = result.paragraphs.filter((_, i) => wanted[i]);
     if (!todo.length) {
       this.status(o, result.paragraphs.length ? "번역할 글자가 없습니다" : "글자를 찾지 못했습니다", false);
       return;
@@ -279,18 +280,31 @@ export class ImageTranslator {
     const all = result.paragraphs.map((p) => p.text).join("\n");
     const context = todo.length > 1 && all.length <= 400 ? all : null;
     let failed = 0;
-    const texts = Promise.all(
-      todo.map((p) => {
-        const id = this.client.newId();
-        o.reqIds.push(id);
-        return this.client
-          .translate({ id, text: p.text, targetLang, context, priority: 2 })
-          .catch((e: Error) => {
-            if (e?.name !== "AbortError") failed++;
-            return null;
-          });
-      }),
-    );
+    const ask = (text: string) => {
+      const id = this.client.newId();
+      o.reqIds.push(id);
+      return this.client.translate({ id, text, targetLang, context, priority: 2 }).catch((e: Error) => {
+        if (e?.name !== "AbortError") failed++;
+        return null;
+      });
+    };
+    // a phrase set on several lines (a block) is translated as one text and laid back over its lines; where its lines
+    // turn out to be a list — each says the same translated alone — every line keeps its own translation
+    const inBlock = new Map<number, Promise<string | null>>();
+    for (const b of blocks) {
+      const ps = b.map((i) => result.paragraphs[i]);
+      const cjk = (t: string) => /[　-ヿ㐀-鿿豈-﫿＀-￯]/.test(t);
+      const whole = ps.map((p) => p.text).reduce((a, t) => a + (cjk(a.at(-1) ?? "") || cjk(t[0]) ? "" : " ") + t);
+      const done = Promise.all([ask(ps.map((p) => p.text).join("\n")), ask(whole)]).then(([lines, one]): (string | null)[] => {
+        const byLine = lines?.split("\n").map((l) => l.trim());
+        if (byLine?.length === ps.length && (one == null || isList(byLine, one))) return byLine;
+        if (one == null) return ps.map(() => null);
+        // each line's room: its extent along the line in em, times its lines
+        return reflow(one, ps.map((p) => ((p.vertical ? p.inkBox[3] : p.inkBox[2]) / p.fontPx) * p.lines.length));
+      });
+      b.forEach((i, k) => inBlock.set(i, done.then((r) => r[k])));
+    }
+    const texts = Promise.all(todo.map((p) => inBlock.get(result.paragraphs.indexOf(p)) ?? ask(p.text)));
     const t0 = performance.now();
     let tTexts = 0, tPatches = 0;
     const [translations, later] = await Promise.all([
@@ -302,7 +316,7 @@ export class ImageTranslator {
     const patches = new Map<number, ErasePatch>([...result.patches, ...later].map((p) => [p.i, p]));
 
     // structure is inferred over all text, including text left untranslated (it still anchors rows and columns)
-    const lays = inferLayout(result.paragraphs);
+    const lays = inferLayout(result.paragraphs, result);
     const space = freeSpace(result);
     const metrics = new Map<boolean, FontMetrics>();
     const metricsFor = (bold: boolean) => {
@@ -317,7 +331,7 @@ export class ImageTranslator {
       const lay = lays[i];
       if (!groups.has(lay.group)) groups.set(lay.group, new FitGroup());
       const view = new ParaView(p, lay, { stage: o.stage, result, targetLang, ...space[i], metrics: metricsFor, patch: patches.get(i) }, groups.get(lay.group)!);
-      if (translations[k] != null) view.set(translations[k]);
+      if (translations[k] != null) view.set(translations[k], inBlock.has(i));
       else view.fail("번역하지 못했습니다");
     });
     for (const g of groups.values()) g.run();
@@ -335,19 +349,21 @@ export class ImageTranslator {
 /**
  * Free space for each paragraph's translation: along the line on each side — the plain background measured on the
  * image, cut at the midpoint to the next text on the same line (both may grow into the gap, keeping 0.6 em
- * apart) and at the image edge — and below it, up to the next text underneath. Text on a busy background stays put.
+ * apart) and at the image edge — and below and above it, up to the next text there. Text on a busy background stays put.
  */
-function freeSpace(result: OcrResult): { limits: [number, number]; below: number }[] {
+function freeSpace(result: OcrResult): { limits: [number, number]; below: number; above: number }[] {
   const ps = result.paragraphs;
   const ax = ps.map(axes);
   return ps.map((p, i) => {
-    if (p.busy) return { limits: [0, 0], below: 0 };
+    if (p.busy) return { limits: [0, 0], below: 0, above: 0 };
     const [s, e] = ax[i].along;
     const size = p.vertical ? result.height : result.width;
     const keep = p.fontPx * 0.3;
     let before = Math.min(s, p.vertical ? p.room[2] : p.room[0]);
     let after = Math.min(size - e, p.vertical ? p.room[3] : p.room[1]);
     let below = p.vertical ? p.room[0] : p.room[3];
+    // and on the other side across the lines (above; columns: to the right)
+    let above = p.vertical ? p.room[1] : p.room[2];
     const [a0, a1] = ax[i].across;
     ps.forEach((q: OcrParagraph, j) => {
       if (j === i || q.vertical !== p.vertical) return;
@@ -360,8 +376,10 @@ function freeSpace(result: OcrResult): { limits: [number, number]; below: number
         // text underneath (columns: to the left) that the paragraph overlaps along its line
         const gap = p.vertical ? a0 - b1 : b0 - a1;
         if (gap >= 0) below = Math.min(below, gap - keep);
+        const back = p.vertical ? b0 - a1 : a0 - b1;
+        if (back >= 0) above = Math.min(above, back - keep);
       }
     });
-    return { limits: [Math.max(0, before), Math.max(0, after)], below: Math.max(0, below) };
+    return { limits: [Math.max(0, before), Math.max(0, after)], below: Math.max(0, below), above: Math.max(0, above) };
   });
 }

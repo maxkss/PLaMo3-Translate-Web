@@ -27,6 +27,13 @@ export function patchRect(img: Pixels, p: Pick<OcrParagraph, "inkBox" | "fontPx"
   return [x0, y0, x1 - x0, y1 - y0];
 }
 
+/**
+ * How far a glyph mask is grown past the pixels found: 0.08 em. In proportion to the size, because the soft edge of
+ * text in a photo is (a sign shot at 3000 px has edges 8 px wide; a cap of a few pixels, enough for rendered designs,
+ * leaves its letters as ghosts).
+ */
+const grow = (fontPx: number) => Math.max(2, Math.round(0.08 * fontPx));
+
 /** Mark the paragraph's text pixels in `mask` (1 = to erase). */
 export function markText(img: Pixels, mask: Uint8Array, p: Pick<OcrParagraph, "inkBox" | "fontPx" | "bg" | "fg">, wholeBox: boolean): void {
   const { width: W, height: H, data } = img;
@@ -53,7 +60,7 @@ export function markText(img: Pixels, mask: Uint8Array, p: Pick<OcrParagraph, "i
     }
   }
   // dilate (square neighbourhood) into the mask
-  const rad = Math.max(2, Math.round(0.08 * p.fontPx));
+  const rad = grow(p.fontPx);
   const w = x1 - x0;
   for (let y = y0; y < y1; y++) {
     for (let x = x0; x < x1; x++) {
@@ -63,6 +70,129 @@ export function markText(img: Pixels, mask: Uint8Array, p: Pick<OcrParagraph, "i
       }
     }
   }
+}
+
+/**
+ * Mark the glyphs of one line that lies on a photo or any background too uneven for `markText`'s single background
+ * colour. The line's colours are clustered (k-means, 3 colours). Text is a colour's pixels that are not connected to
+ * the frame of the line's box, drawn in strokes (thin against the font size) and present along the whole line; of two
+ * such colours, the one enclosed by the other.
+ * Returns the text's colour — or null, marking nothing, when no colour looks like that (text filled with a photo or a gradient, letters
+ * that run into something of their own colour): the caller then erases the whole box.
+ */
+export function markGlyphs(img: Pixels, mask: Uint8Array, line: Rect, fontPx: number, vertical: boolean): [number, number, number] | null {
+  const { width: W, height: H, data } = img;
+  const g = Math.max(1, Math.round(0.12 * fontPx));
+  const x0 = Math.max(0, Math.floor(line[0] - g)), y0 = Math.max(0, Math.floor(line[1] - g));
+  const x1 = Math.min(W, Math.ceil(line[0] + line[2] + g)), y1 = Math.min(H, Math.ceil(line[1] + line[3] + g));
+  const w = x1 - x0, h = y1 - y0;
+  if (w < 4 || h < 4) return null;
+  // ---- three colours of the line (k-means on a sample; seeds: the mean, then the farthest from the seeds so far)
+  const step = Math.max(1, Math.floor(Math.sqrt((w * h) / 5000)));
+  const sample: number[] = [];
+  for (let y = y0; y < y1; y += step) for (let x = x0; x < x1; x += step) sample.push((y * W + x) * 4);
+  const K = 3;
+  const cen: number[][] = [[0, 0, 0]];
+  for (const i of sample) for (let k = 0; k < 3; k++) cen[0][k] += data[i + k] / sample.length;
+  const d2 = (i: number, c: number[]) => (data[i] - c[0]) ** 2 + (data[i + 1] - c[1]) ** 2 + (data[i + 2] - c[2]) ** 2;
+  while (cen.length < K) {
+    let best = sample[0], bv = -1;
+    for (const i of sample) {
+      const v = Math.min(...cen.map((c) => d2(i, c)));
+      if (v > bv) (bv = v), (best = i);
+    }
+    cen.push([data[best], data[best + 1], data[best + 2]]);
+  }
+  const nearest = (i: number) => {
+    let b = 0, bv = Infinity;
+    for (let c = 0; c < cen.length; c++) {
+      const v = d2(i, cen[c]);
+      if (v < bv) (bv = v), (b = c);
+    }
+    return b;
+  };
+  for (let it = 0; it < 8; it++) {
+    const sum = cen.map(() => [0, 0, 0, 0]);
+    for (const i of sample) {
+      const s = sum[nearest(i)];
+      (s[0] += data[i]), (s[1] += data[i + 1]), (s[2] += data[i + 2]), s[3]++;
+    }
+    sum.forEach((s, c) => s[3] && (cen[c] = [s[0] / s[3], s[1] / s[3], s[2] / s[3]]));
+  }
+  // ---- every pixel's cluster
+  const label = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) label[y * w + x] = nearest(((y + y0) * W + x + x0) * 4);
+  // ---- what of each colour is connected to the frame is background: a line's own glyphs do not reach the edge of
+  // their box, whatever is behind them does (also in the text's colour: white letters on a black bar on a white page)
+  const outer = new Uint8Array(w * h);
+  const stack = new Int32Array(w * h);
+  let sp = 0;
+  const seed = (p: number) => {
+    if (!outer[p]) (outer[p] = 1), (stack[sp++] = p);
+  };
+  for (let x = 0; x < w; x++) seed(x), seed((h - 1) * w + x);
+  for (let y = 0; y < h; y++) seed(y * w), seed(y * w + w - 1);
+  while (sp) {
+    const p = stack[--sp];
+    const c = label[p], x = p % w;
+    if (x > 0 && !outer[p - 1] && label[p - 1] === c) (outer[p - 1] = 1), (stack[sp++] = p - 1);
+    if (x < w - 1 && !outer[p + 1] && label[p + 1] === c) (outer[p + 1] = 1), (stack[sp++] = p + 1);
+    if (p >= w && !outer[p - w] && label[p - w] === c) (outer[p - w] = 1), (stack[sp++] = p - w);
+    if (p < w * (h - 1) && !outer[p + w] && label[p + w] === c) (outer[p + w] = 1), (stack[sp++] = p + w);
+  }
+  // ---- the text cluster: its inner pixels are strokes (thin against the font size), found along the whole line
+  const bin = Math.max(2, Math.round(0.6 * fontPx));
+  const alongN = vertical ? h : w;
+  const cands: { c: number; n: number; box: [number, number, number, number] }[] = [];
+  for (let c = 0; c < K; c++) {
+    let n = 0, edges = 0, bx0 = w, by0 = h, bx1 = -1, by1 = -1;
+    const bins = new Uint8Array(Math.ceil(alongN / bin));
+    const on = (p: number) => label[p] === c && !outer[p];
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const p = y * w + x, v = on(p);
+        if (v) {
+          n++;
+          bins[Math.floor((vertical ? y : x) / bin)] = 1;
+          if (x < bx0) bx0 = x;
+          if (x > bx1) bx1 = x;
+          if (y < by0) by0 = y;
+          if (y > by1) by1 = y;
+        }
+        // stroke thickness ≈ 2 · area / outline length
+        if (x > 0 && v !== on(p - 1)) edges++;
+        if (y > 0 && v !== on(p - w)) edges++;
+      }
+    }
+    const share = n / (w * h);
+    if (share < 0.03 || share > 0.6) continue;
+    const thick = (2 * n) / Math.max(1, edges), spread = bins.reduce((a, b) => a + b, 0) / bins.length;
+    if (thick > 0.3 * fontPx + 1 || spread < 0.6) continue;
+    cands.push({ c, n, box: [bx0, by0, bx1, by1] });
+  }
+  // a colour whose extent encloses another candidate's is what that one is written on (a label, a highlight bar)
+  const encloses = (o: (typeof cands)[number], i: (typeof cands)[number]) =>
+    o !== i && o.box[0] <= i.box[0] && o.box[1] <= i.box[1] && o.box[2] >= i.box[2] && o.box[3] >= i.box[3] && (o.box[2] - o.box[0]) * (o.box[3] - o.box[1]) > (i.box[2] - i.box[0]) * (i.box[3] - i.box[1]);
+  const inner = cands.filter((k) => !cands.some((i) => encloses(k, i)));
+  if (!inner.length) return null;
+  const best = inner.reduce((m, k) => (k.n > m.n ? k : m));
+  const text = best.c;
+  const inBox = (x: number, y: number) => x + x0 >= line[0] && x + x0 < line[0] + line[2] && y + y0 >= line[1] && y + y0 < line[1] + line[3];
+  // that colour running out to the frame from inside the line's own box. A little of it is letters touching something
+  // of their colour, which go with the rest; much of it, and the colour is in the background too — which of it is
+  // letters cannot be told
+  let loose = 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (label[y * w + x] === text && outer[y * w + x] && inBox(x, y)) loose++;
+  if (loose > 0.5 * best.n) return null;
+  const rad = grow(fontPx);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (label[y * w + x] !== text || (outer[y * w + x] && !inBox(x, y))) continue;
+      const gx = x + x0, gy = y + y0;
+      for (let yy = Math.max(0, gy - rad); yy <= Math.min(H - 1, gy + rad); yy++) mask.fill(1, yy * W + Math.max(0, gx - rad), yy * W + Math.min(W - 1, gx + rad) + 1);
+    }
+  }
+  return cen[text].map(Math.round) as [number, number, number];
 }
 
 /** Fill the masked pixels of `rect` (in place, RGBA) from the unmasked ones, with `margin` pixels around it as context. */
@@ -111,11 +241,20 @@ export function pushPull(img: Pixels, mask: Uint8Array, rect: Rect, margin: numb
     const next = new Float32Array(a.w * a.h * 3);
     for (let y = 0; y < a.h; y++) {
       for (let x = 0; x < a.w; x++) {
-        const i = y * a.w + x, u = (y >> 1) * up.w + (x >> 1);
+        const i = y * a.w + x;
         const k = Math.min(1, a.k[i]);
+        if (k >= 1) {
+          for (let ch = 0; ch < 3; ch++) next[i * 3 + ch] = a.c[i * 3 + ch] / a.k[i];
+          continue;
+        }
+        // the coarser estimate, interpolated (a nearest-neighbour pull leaves its blocks in large holes)
+        const fx = Math.min(up.w - 1, Math.max(0, (x - 0.5) / 2)), fy = Math.min(up.h - 1, Math.max(0, (y - 0.5) / 2));
+        const ux = Math.floor(fx), uy = Math.floor(fy), ux1 = Math.min(up.w - 1, ux + 1), uy1 = Math.min(up.h - 1, uy + 1);
+        const wx = fx - ux, wy = fy - uy;
         for (let ch = 0; ch < 3; ch++) {
           const mean = a.k[i] ? a.c[i * 3 + ch] / a.k[i] : 0;
-          next[i * 3 + ch] = k * mean + (1 - k) * est[u * 3 + ch];
+          const coarse = (est[(uy * up.w + ux) * 3 + ch] * (1 - wx) + est[(uy * up.w + ux1) * 3 + ch] * wx) * (1 - wy) + (est[(uy1 * up.w + ux) * 3 + ch] * (1 - wx) + est[(uy1 * up.w + ux1) * 3 + ch] * wx) * wy;
+          next[i * 3 + ch] = k * mean + (1 - k) * coarse;
         }
       }
     }
@@ -240,13 +379,18 @@ export async function inpaintFill(ort: Ort, session: InferenceSession, img: Pixe
   return true;
 }
 
-/** PNG data: URL of `rect` of the image. */
-export async function encodePatch(img: Pixels, rect: Rect): Promise<string> {
+/**
+ * PNG data: URL of `rect` of the image. With `owner` (which paragraph's hole each pixel is, +1), only paragraph
+ * `i`'s own hole is opaque: the patch then shows nothing of a neighbour's erased text, which the neighbour may not
+ * replace at all (a name that stays as it is keeps its original pixels).
+ */
+export async function encodePatch(img: Pixels, rect: Rect, owner?: Int16Array, i = 0): Promise<string> {
   const [x, y, w, h] = rect;
   const canvas = new OffscreenCanvas(w, h);
   const ctx = canvas.getContext("2d")!;
   const id = ctx.createImageData(w, h);
   for (let yy = 0; yy < h; yy++) id.data.set(img.data.subarray(((y + yy) * img.width + x) * 4, ((y + yy) * img.width + x + w) * 4), yy * w * 4);
+  if (owner) for (let yy = 0; yy < h; yy++) for (let xx = 0; xx < w; xx++) if (owner[(y + yy) * img.width + x + xx] !== i + 1) id.data[(yy * w + xx) * 4 + 3] = 0;
   ctx.putImageData(id, 0, 0);
   const blob = await canvas.convertToBlob({ type: "image/png" });
   const bytes = new Uint8Array(await blob.arrayBuffer());

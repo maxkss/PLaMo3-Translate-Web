@@ -17,7 +17,8 @@ function para(x: number, y: number, w: number, h: number, opts: Partial<OcrParag
     fg: [0, 0, 0],
     busy: false,
     bold: false,
-    room: [200, 200, 200, 200],
+    // open space, more of it to the right (as much on both sides would read as centred)
+    room: [200, 600, 200, 200],
     inkBox: [x, y, w, h],
     ...opts,
   };
@@ -68,4 +69,20 @@ test("busy text keeps its own style and a single coincidence does not decide ali
 test("text tightly enclosed with even margins (a button) is centred", () => {
   const ps = [para(100, 10, 80, 24, { room: [10, 11, 6, 6] })];
   assert.equal(inferLayout(ps)[0].align, "center");
+});
+
+test("a line with as much free space on its left as on its right is centred; aligned neighbours outweigh that", () => {
+  // a headline in the middle of a banner
+  assert.equal(inferLayout([para(400, 50, 200, 40, { room: [400, 404, 50, 300] })])[0].align, "center");
+  // three lines starting at one x: a left-aligned stack, whatever the room of each
+  const ps = [0, 1, 2].map((r) => para(100, 40 + 60 * r, 120 + 40 * r, 24, { room: [100, 100 + 2 * r, 20, 20] }));
+  assert.deepEqual(inferLayout(ps).map((l) => l.align), ["start", "start", "start"]);
+});
+
+test("a block of even lines on the image's centre line is centred, not start-aligned", () => {
+  // four lines of nearly one width: their starts line up as well as their centres do
+  const lines = [0, 1, 2, 3].map((r) => ({ box: [300 - r, 100 + 40 * r, 200 + 2 * r, 36] as [number, number, number, number], text: "TEXT", score: 1, ink: [104 + 40 * r, 132 + 40 * r] as [number, number], span: [302 - r, 498 + r] as [number, number] }));
+  const p = para(299, 104, 202, 148, { lines, room: [150, 260, 50, 50] });
+  assert.equal(inferLayout([p], { width: 800, height: 600 })[0].align, "center");
+  assert.equal(inferLayout([p], { width: 1600, height: 600 })[0].align, "start");
 });

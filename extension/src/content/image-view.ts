@@ -21,6 +21,8 @@ const LH = 1.2;
 export const FONT_FAMILY = `system-ui, -apple-system, "Apple SD Gothic Neo", "Noto Sans KR", "Hiragino Sans", "Noto Sans JP", sans-serif`;
 /** The group's common scale never goes below this: members that need less are exceptions. */
 const FLOOR = 0.85;
+/** Share of the free space beside a block of columns that its translation may grow into, on each side. */
+const GROW = 0.6;
 /** Smallest scale; beyond it the text overflows its box. */
 const MIN_SCALE = 0.45;
 
@@ -59,6 +61,7 @@ export class FitGroup {
   readonly views: ParaView[] = [];
   /** Size and place every member (once all translations are in). */
   run(): void {
+    for (const v of this.views) if (v.blank) v.apply(1, false);
     const live = this.views.filter((v) => v.text);
     const fits = live.map((v) => v.measure());
     // the 20th percentile, but not below the floor — unless most members are below it, then the group goes down to
@@ -86,6 +89,8 @@ export interface ViewContext {
   limits: [number, number];
   /** free space below the paragraph's ink (left of it for columns), up to the next text */
   below: number;
+  /** free space above it (right of it for columns) */
+  above: number;
   metrics: (bold: boolean) => FontMetrics;
   /** the background with the original text erased (else a fill colour stands in for it) */
   patch?: ErasePatch;
@@ -93,6 +98,8 @@ export interface ViewContext {
 
 export class ParaView {
   text = "";
+  /** erased, with nothing written over it */
+  blank = false;
   private readonly el: HTMLDivElement;
   private readonly span: HTMLSpanElement;
   private erased: HTMLImageElement | null = null;
@@ -103,6 +110,9 @@ export class ParaView {
   /** font size at scale 1 (image px): the style size, adjusted so the target script's glyphs look as tall */
   private readonly size: number;
   private readonly pad: number;
+  /** line height of a block: the original's line pitch over the font size */
+  private readonly lh: number;
+  private readonly keepWords: boolean;
   private readonly p: OcrParagraph;
   private readonly lay: ParaLayout;
   private readonly ctx: ViewContext;
@@ -116,10 +126,23 @@ export class ParaView {
     group.views.push(this);
     this.vertical = p.vertical && /^(ja|ja-easy|zh-hans|zh-hant|ko)$/.test(ctx.targetLang);
     this.single = p.lines.length === 1 && p.vertical === this.vertical;
-    // the source size was estimated from ink assuming CJK ink spans 0.93 em; match the target script's ink height
-    const ratio = Math.min(1.15, Math.max(0.9, 0.93 / ctx.metrics(p.bold).inkHeight));
+    // the same size to the eye, not the same em: the translation's glyphs are drawn as tall as the original's. Han,
+    // kana and Hangul fill 0.85–0.93 em; Latin text reads at its capital height, 0.74 em — set at the same em, Hangul
+    // comes out a fifth taller than the Latin headline it replaces, and tightly stacked lines run into each other
+    const cjk = (t: string) => /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(t);
+    const tall = ctx.metrics(p.bold).inkHeight;
+    const targetCjk = /^(ko|ja|ja-easy|zh-hans|zh-hant)$/.test(ctx.targetLang);
+    const sourceInk = cjk(p.text) ? 0.93 : targetCjk ? 0.74 : tall;
+    const ratio = Math.min(1.15, Math.max(0.85, sourceInk / tall));
     this.size = lay.em * ratio;
     this.pad = Math.max(1, lay.em * 0.18);
+    // a block keeps the original's line pitch (the distance between its lines' ink centres), so its lines stay where
+    // the design put them — next to their bullets, on their bars
+    const mids = p.lines.map((l) => (l.ink ? (l.ink[0] + l.ink[1]) / 2 : p.vertical ? l.box[0] + l.box[2] / 2 : l.box[1] + l.box[3] / 2)).sort((a, b) => a - b);
+    const steps = mids.slice(1).map((v, k) => v - mids[k]).sort((a, b) => a - b);
+    this.lh = steps.length && p.vertical === this.vertical ? Math.min(2.6, Math.max(1.05, steps[steps.length >> 1] / this.size)) : LH;
+    // Korean breaks between words, not inside them
+    this.keepWords = ctx.targetLang === "ko";
     this.el = document.createElement("div");
     this.el.className = p.busy && !p.gradient && !ctx.patch ? "img-para busy" : "img-para";
     this.el.title = p.text;
@@ -145,7 +168,15 @@ export class ParaView {
       this.el.append(this.erased);
     }
     this.span = document.createElement("span");
-    Object.assign(this.span.style, { position: "absolute", lineHeight: String(LH), writingMode: this.vertical ? "vertical-rl" : "horizontal-tb" });
+    Object.assign(this.span.style, {
+      position: "absolute",
+      lineHeight: String(this.single ? LH : this.lh),
+      writingMode: this.vertical ? "vertical-rl" : "horizontal-tb",
+      // spaced-out text stays spaced out
+      letterSpacing: p.tracking ? `${p.tracking}em` : "",
+      // lines of even length, as a designer breaks a headline (a few lines only: the browser limits it anyway)
+      textWrap: "balance",
+    });
     this.el.append(this.span);
     this.el.addEventListener("click", (e) => {
       // peek at the original under this paragraph
@@ -155,7 +186,19 @@ export class ParaView {
     });
   }
 
-  set(text: string): void {
+  /**
+   * `blank`: a line of a phrase whose translation went to the phrase's other lines — its original text is erased and
+   * nothing is written in its place.
+   */
+  set(text: string, blank = false): void {
+    this.blank = blank && !text.trim();
+    if (this.blank) {
+      this.text = "";
+      this.span.textContent = "";
+      if (!this.shown) this.ctx.stage.append(this.el);
+      this.shown = true;
+      return;
+    }
     // text that comes out unchanged (names, numbers, "DISCOVER") keeps the original pixels
     const norm = (t: string) => t.normalize("NFKC").toLowerCase().replace(/\s+/g, "");
     if (!text.trim() || norm(this.p.text).startsWith(norm(text))) {
@@ -223,10 +266,20 @@ export class ParaView {
     s.whiteSpace = "normal";
     s.width = this.vertical ? "" : `${w}px`;
     s.height = this.vertical ? `${h}px` : "";
-    const one = search((k) => {
-      s.fontSize = `${this.size * k}px`;
-      return this.span.offsetWidth <= w + 1 && this.span.offsetHeight <= h + 1 && this.span.scrollWidth <= w + 1;
-    });
+    const fit = () =>
+      search((k) => {
+        s.fontSize = `${this.size * k}px`;
+        return this.span.offsetWidth <= w + 1 && this.span.offsetHeight <= h + 1 && this.span.scrollWidth <= w + 1;
+      });
+    // whole words per line where that costs little size; a narrow block whose words would not fit breaks anywhere
+    s.wordBreak = this.keepWords ? "keep-all" : "";
+    let one = fit();
+    if (this.keepWords && one < 0.9) {
+      s.wordBreak = "";
+      const loose = fit();
+      if (loose > one * 1.15) one = loose;
+      else s.wordBreak = "keep-all";
+    }
     return { one: one || MIN_SCALE, two: 0 };
   }
 
@@ -234,7 +287,13 @@ export class ParaView {
   private blockSize(): [number, number] {
     const [, , iw, ih] = this.p.inkBox;
     const room = this.p.busy ? 0 : this.ctx.below;
-    if (this.vertical) return [iw + room * 0.8, ih];
+    if (this.vertical) {
+      // columns in a speech bubble: the bubble's space is all round the text, and a translation needs more of it than
+      // the original took. It grows evenly to both sides and along the columns, so it stays in the middle of its space.
+      const [before, after] = this.p.busy ? [0, 0] : this.ctx.limits;
+      const side = this.p.busy ? 0 : Math.min(room, this.ctx.above);
+      return [iw + 2 * GROW * side, ih + 2 * GROW * Math.min(before, after)];
+    }
     if (this.p.vertical) {
       // a column translated into a horizontal script: a wider box around the same centre
       const w = Math.max(iw, Math.min(this.ctx.result.width, ih * 0.9));
@@ -274,15 +333,16 @@ export class ParaView {
       const place = (extent: number) => (this.lay.align === "start" ? this.lay.anchor : this.lay.align === "end" ? this.lay.anchor - extent : this.lay.anchor - extent / 2);
       if (this.vertical) {
         // columns run right to left from the original right edge
-        tx = ix + iw - tw;
-        ty = place(th);
+        // within the original area from its first column and its top; grown past it, around its centre
+        tx = tw > iw + 1 ? ix + iw / 2 - tw / 2 : ix + iw - tw + ((this.lh - LH) / 2) * f;
+        ty = th > ih + 1 ? iy + ih / 2 - th / 2 : place(th);
       } else if (this.p.vertical) {
         tx = ix + iw / 2 - tw / 2;
         ty = iy + ih / 2 - th / 2;
       } else {
         tx = place(tw);
-        // first line's ink top on the original ink top
-        ty = iy - (m.inkCentre - m.inkHeight / 2) * f;
+        // first line's ink top on the original ink top (the metrics are for a line box of height LH)
+        ty = iy - (m.inkCentre + (this.lh - LH) / 2 - m.inkHeight / 2) * f;
       }
     }
     // the box covers the original ink (or the erased patch) and the new text

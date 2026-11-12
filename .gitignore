@@ -9,4 +9,5 @@ __pycache__/
 
 # evaluation images (rebuilt by extension/eval/build.mjs; most sources forbid redistribution)
 extension/eval/data/
+extension/eval/holdout/
 extension/eval/results/

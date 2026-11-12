@@ -261,7 +261,9 @@ function sameStyle(a: Style, b: Style): boolean {
   // a busy ring makes the background estimate unreliable only when both are busy (text on one photo); a badge next
   // to a label on a plain background is a different element
   const busy = (x: Style) => x.noise > 30;
-  return busy(a) && busy(b) ? true : !busy(a) && !busy(b) && cdist(a.bg, b.bg) < 50;
+  // (one of them busy: the median of its ring still tells — a column next to its speech bubble's outline has the
+  // outline in its ring and the bubble's white as the median, like the column beside it)
+  return busy(a) && busy(b) ? true : cdist(a.bg, b.bg) < 50;
 }
 
 /**
@@ -314,7 +316,11 @@ export function group(lines: StyledLine[]): (Omit<OcrParagraph, "bg" | "fg" | "b
         if (Math.max(sa, sb) > 1.25 * Math.min(sa, sb)) continue;
         const gap = Math.max(a.v0, b.v0) - Math.min(a.v1, b.v1);
         // line spacing inside a paragraph is tight; a larger gap starts a new block
-        if (gap > 0.5 * Math.min(sa, sb) || gap < -0.4 * Math.min(sa, sb)) continue;
+        if (gap > 0.5 * Math.min(sa, sb)) continue;
+        // two readings of one line overlap; neighbouring lines do not. Judged on the ink where it was found: the
+        // detector's boxes around the columns of a speech bubble overlap by half their width, their glyphs not at all
+        const deep = a.ink && b.ink ? Math.min(a.ink[1], b.ink[1]) - Math.max(a.ink[0], b.ink[0]) > 0.4 * Math.min(a.ink[1] - a.ink[0], b.ink[1] - b.ink[0]) : gap < -0.4 * Math.min(sa, sb);
+        if (deep) continue;
         const ov = overlap(a.u0, a.u1, b.u0, b.u1);
         // lines of a paragraph overlap along the line, or start at the same place
         if (ov <= 0 && Math.abs(a.u0 - b.u0) > sa) continue;
@@ -353,19 +359,26 @@ const lum = ([r, g, b]: Rgb) => 0.2126 * r + 0.7152 * g + 0.0722 * b;
  * Background: per-channel median of a thin ring just outside the line boxes. Text: mean of the pixels inside the lines
  * that differ most from the background (top 15%). Also how busy the background is and how thick the strokes are.
  */
-export function measure(img: Pixels, boxes: Box[]): Style {
+export function measure(img: Pixels, boxes: Box[], others: Box[] = []): Style {
   const { width: W, height: H, data } = img;
-  const ring: number[] = [];
+  let ring: number[] = [];
+  const clear: number[] = [];
   const step = (n: number) => Math.max(1, Math.floor(n / 60));
+  // other text is not background: where lines are set tightly, the ring above and below a line runs through its
+  // neighbours' glyphs, and the same paragraph would look plain on one line and busy on the next
+  const foreign = others.filter((o) => !boxes.includes(o));
   const add = (x: number, y: number) => {
     if (x < 0 || y < 0 || x >= W || y >= H) return;
-    ring.push((Math.floor(y) * W + Math.floor(x)) * 4);
+    const i = (Math.floor(y) * W + Math.floor(x)) * 4;
+    ring.push(i);
+    if (!foreign.some((o) => x >= o[0] && x < o[0] + o[2] && y >= o[1] && y < o[1] + o[3])) clear.push(i);
   };
   for (const [x, y, w, h] of boxes) {
     const pad = Math.max(2, h * 0.08);
     for (let xx = x; xx < x + w; xx += step(w)) add(xx, y - pad), add(xx, y + h + pad);
     for (let yy = y; yy < y + h; yy += step(h)) add(x - pad, yy), add(x + w + pad, yy);
   }
+  if (clear.length >= 8) ring = clear;
   const bg: Rgb = ring.length ? [0, 1, 2].map((k) => median(ring.map((i) => data[i + k]))) as Rgb : [255, 255, 255];
   // 80th percentile of the ring's distance from the background: a small icon or emoji touching the ring does not make
   // the background "busy", a photo or gradient does
@@ -488,7 +501,9 @@ export function freeRoom(img: Pixels, ink: Box, bg: Rgb, limit: number, skip: nu
  */
 export function inkRatio(text: string): number {
   if (/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(text)) return EM_CJK;
-  const asc = /[A-Z0-9bdfhklt]/.test(text), desc = /[gjpqy]/.test(text);
+  // brackets, slashes and bars span ascender to descender
+  const tall = /[()\[\]{}\/|]/.test(text);
+  const asc = tall || /[A-Z0-9bdfhijklt]/.test(text), desc = tall || /[gjpqy,;]/.test(text);
   return asc && desc ? 0.93 : asc || desc ? 0.72 : 0.52;
 }
 // calibrated on rendered CJK text (test/typo-eval.mjs): ideographs and kana span ~93% of the em vertically
@@ -504,9 +519,11 @@ export function inkBand(img: Pixels, box: Box, vertical: boolean, s: Pick<Style,
   const [x, y, w, h] = box;
   const across = Math.max(1, Math.round(vertical ? w : h));
   const along = vertical ? h : w;
-  const step = Math.max(1, Math.floor(along / 400));
+  // every pixel along the line up to 2000: an ascender or descender is one stroke in a row hundreds of pixels long
+  const step = Math.max(1, Math.floor(along / 2000));
   const contrast = (cdist(s.fg, s.bg) / 2) ** 2;
   const prof = new Float32Array(across);
+  let samples = 1;
   for (let a = 0; a < across; a++) {
     let n = 0, tot = 0;
     for (let t = 0; t < along; t += step) {
@@ -518,8 +535,10 @@ export function inkBand(img: Pixels, box: Box, vertical: boolean, s: Pick<Style,
       if (db > contrast && dist2(data, i, s.fg) < db) n++;
     }
     prof[a] = tot ? n / tot : 0;
+    samples = Math.max(samples, tot);
   }
-  // rows with real strokes: a thin stroke reaching past the glyph body (a slash, a bracket, an accent) does not count
+  // the body of the glyphs: rows with real strokes (a thin stroke reaching past it — a slash, an accent — does not
+  // count, nor does ink of a neighbouring line that the detector box overlaps)
   const peak = Math.max(...prof);
   const on = (a: number) => prof[a] >= Math.max(0.01, 0.12 * peak);
   // contiguous bands, bridging gaps up to 12% of the box thickness
@@ -536,7 +555,22 @@ export function inkBand(img: Pixels, box: Box, vertical: boolean, s: Pick<Style,
   const dist = ([a, b]: [number, number]) => (c < a ? a - c : c > b ? c - b : 0);
   // the band at the centre, or else the thickest one
   bands.sort((p, q) => dist(p) - dist(q) || q[1] - q[0] - (p[1] - p[0]));
-  const [a, b] = bands[0];
+  let [a, b] = bands[0];
+  // then outwards over rows that still have ink, as far as ascenders and descenders reach past a body of that height
+  // (in a long line one letter in thirty has them: far below any share of the densest row, and without them the font
+  // measures half its size). An empty row — the leading before the next line — ends it.
+  const faint = (r: number) => r >= 0 && r < across && prof[r] >= Math.max(1 / samples, 0.005 * peak);
+  const body = b - a + 1;
+  // upwards also across the gap under a dot or an accent (i, j, é)
+  const hop = Math.max(1, Math.round(0.2 * body));
+  for (let up = Math.ceil(0.7 * body); up > 0; ) {
+    let n = 1;
+    while (n <= hop + 1 && !faint(a - n)) n++;
+    if (n > hop + 1 || n > up) break;
+    a -= n;
+    up -= n;
+  }
+  for (let down = Math.ceil(0.5 * body); down > 0 && faint(b + 1); down--) b++;
   const o = vertical ? x : y;
   return [o + a, o + b + 1];
 }
@@ -594,4 +628,32 @@ export function sideBackgrounds(img: Pixels, ink: Box, pad: number): { colour: R
     side(along(x, x + w).map((v) => [v, y])),
     side(along(x, x + w).map((v) => [v, y + h])),
   ];
+}
+
+/**
+ * Widths of the empty stretches between glyphs along a line (pixels), inside its ink band and span: how tightly the
+ * text is set. Joined or overlapping glyphs (script faces, kerned pairs) leave none.
+ */
+export function glyphGaps(img: Pixels, vertical: boolean, band: [number, number], span: [number, number], s: Pick<Style, "bg" | "fg">): number[] {
+  const { width: W, height: H, data } = img;
+  const contrast = (cdist(s.fg, s.bg) / 2) ** 2;
+  const a0 = Math.floor(band[0]), a1 = Math.ceil(band[1]);
+  const gaps: number[] = [];
+  let run = 0, seen = false;
+  for (let t = Math.floor(span[0]); t < Math.ceil(span[1]); t++) {
+    let ink = false;
+    for (let a = a0; a < a1 && !ink; a++) {
+      const px = vertical ? a : t, py = vertical ? t : a;
+      if (px < 0 || py < 0 || px >= W || py >= H) continue;
+      const i = (py * W + px) * 4;
+      const db = dist2(data, i, s.bg);
+      ink = db > contrast && dist2(data, i, s.fg) < db;
+    }
+    if (ink) {
+      if (seen && run) gaps.push(run);
+      seen = true;
+      run = 0;
+    } else run++;
+  }
+  return gaps;
 }

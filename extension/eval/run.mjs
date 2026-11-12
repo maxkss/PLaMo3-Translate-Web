@@ -25,14 +25,21 @@ import { fileURLToPath } from "node:url";
 import { launch } from "../test/lib.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const DATA = join(HERE, "data");
+// --data=holdout evaluates the hold-out set (node eval/build.mjs --holdout)
+const DATA = join(HERE, process.argv.find((a) => a.startsWith("--data="))?.slice(7) ?? "data");
 const args = process.argv.slice(2);
 const size = args.find((a) => /^(0\.8b|2b)$/.test(a)) ?? "0.8b";
-const sets = args.find((a) => a.startsWith("--sets="))?.slice(7).split(",") ?? ["cagui", "hiertext", "openmantra", "vistra", "websight"];
+const sets = args.find((a) => a.startsWith("--sets="))?.slice(7).split(",") ?? ["cagui", "hiertext", "openmantra", "vistra", "websight", "crello"];
 const limit = Number(args.find((a) => a.startsWith("--limit="))?.slice(8) ?? 0);
 const doTranslate = !args.includes("--no-translate");
 const doTypography = !args.includes("--no-typography");
 const ocrModel = args.find((a) => a.startsWith("--ocr="))?.slice(6) ?? "mobile";
+// screenshots of the first N translated images of each typography set, to eval/results/shots-<tag>/
+// --tag=<name> labels the run (report file name, screenshot folder)
+const tag = args.find((a) => a.startsWith("--tag="))?.slice(6) ?? "run";
+// --overlay=N: translate N images of each set without style ground truth through the page overlay as well
+const overlay = Number(args.find((a) => a.startsWith("--overlay="))?.slice(10) ?? 0);
+const shots = Number(args.find((a) => a.startsWith("--shots="))?.slice(8) ?? 0);
 const log = (...a) => console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...a);
 
 // ---------------------------------------------------------------- metrics
@@ -103,6 +110,8 @@ function chrF(pairs) {
 const area = (b) => Math.max(0, b[2]) * Math.max(0, b[3]);
 const inter = (a, b) => Math.max(0, Math.min(a[0] + a[2], b[0] + b[2]) - Math.max(a[0], b[0])) * Math.max(0, Math.min(a[1] + a[3], b[1] + b[3]) - Math.max(a[1], b[1]));
 const mean = (xs) => (xs.length ? +(xs.reduce((a, b) => a + b, 0) / xs.length).toFixed(3) : null);
+const median = (xs) => (xs.length ? +[...xs].sort((a, b) => a - b)[xs.length >> 1].toFixed(3) : null);
+const share = (xs, f) => (xs.length ? +(xs.filter(f).length / xs.length).toFixed(3) : null);
 
 /** Detection and recognition of one image against its boxed ground truth. */
 function scoreBoxes(item, ocr) {
@@ -138,7 +147,7 @@ const ocrOn = (ext, src) =>
         if (m.id !== id) return;
         if (m.type === "ocr-done" || m.type === "error") {
           port.onMessage.removeListener(on);
-          done(m.type === "ocr-done" ? { paragraphs: m.result.paragraphs.map((p) => ({ box: p.box, text: p.text })), ms: m.result.ms } : { error: m.message });
+          done(m.type === "ocr-done" ? { paragraphs: m.result.paragraphs.map((p) => ({ box: p.box, text: p.text, fontPx: p.fontPx, bold: p.bold, lines: p.lines.length, inkBox: p.inkBox })), ms: m.result.ms } : { error: m.message });
         }
       };
       port.onMessage.addListener(on);
@@ -174,7 +183,7 @@ const srv = createServer((req, res) => {
 }).listen(8789);
 const pageSrv = createServer((req, res) => {
   const img = new URL(req.url, "http://x").searchParams.get("img");
-  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }).end(`<!doctype html><meta charset="utf-8"><body style="margin:0"><img id="im" src="http://127.0.0.1:8789/${img}" style="display:block">`);
+  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }).end(`<!doctype html><meta charset="utf-8"><body style="margin:0"><img id="im" src="http://127.0.0.1:8789/${img}" style="display:block;max-width:1060px;max-height:2000px">`);
 }).listen(8788);
 
 const { ctx, sw, opts: ext } = await launch({ size, viewport: { width: 1100, height: 2100 } });
@@ -206,6 +215,16 @@ try {
       } else {
         r.boxes = scoreBoxes(item, ocr);
       }
+      // style read-back (sets with rendered styles): a source run covered by exactly one OCR paragraph that covers
+      // nothing else — the estimated font size over the true one, and whether bold was seen
+      if (item.styles) {
+        r.font = [];
+        for (const s of item.styles) {
+          const hits = ocr.paragraphs.filter((p) => inter(p.box, s.box) > 0.5 * Math.min(area(p.box), area(s.box)));
+          if (hits.length !== 1 || item.styles.filter((t) => inter(hits[0].box, t.box) > 0.3 * area(t.box)).length !== 1) continue;
+          r.font.push({ ratio: hits[0].fontPx / s.fontSize, bold: hits[0].bold === s.fontWeight >= 600, size: s.fontSize, text: s.text.slice(0, 30), font: s.font });
+        }
+      }
       per.push(r);
     }
     const ok = per.filter((r) => !r.error);
@@ -220,6 +239,11 @@ try {
         summary.split = +(sum("split") / Math.max(1, sum("found"))).toFixed(3);
         summary.merge = +(sum("merge") / Math.max(1, sum("ocr"))).toFixed(3);
       }
+    }
+
+    if (items[0]?.styles) {
+      const f = ok.flatMap((r) => r.font ?? []);
+      summary.font = { n: f.length, ratio: median(f.map((x) => x.ratio)), within10: share(f, (x) => x.ratio >= 0.9 && x.ratio <= 1.1), within20: share(f, (x) => x.ratio >= 0.8 && x.ratio <= 1.2), bold: share(f, (x) => x.bold) };
     }
 
     // translation quality of the ground-truth text against professional references
@@ -241,10 +265,16 @@ try {
     }
 
     // typography through the real page overlay
-    if (doTypography && set === "websight") {
+    // (sets without style ground truth: --overlay=N translates N images spread over the set, for the screenshots and
+    // the measures that need no ground truth)
+    if (doTypography && (items[0]?.styles || overlay)) {
       const page = await ctx.newPage();
       const typo = [];
-      for (const item of items) {
+      // --e2e: sets with English references are translated into English, and what the overlay shows is scored
+      const e2e = args.includes("--e2e") && items[0]?.regions[0]?.refs?.en;
+      if (e2e) await sw.evaluate(() => chrome.storage.local.set({ targetLang: "en" }));
+      const every = items[0]?.styles ? 1 : Math.max(1, Math.floor(items.length / overlay));
+      for (const item of items.filter((_, k) => k % every === 0).slice(0, items[0]?.styles ? items.length : overlay)) {
         await page.goto(`http://localhost:8788/?img=${set}/${item.image}`);
         await page.waitForFunction(() => document.images[0]?.complete && document.images[0].naturalWidth);
         await page.locator("#im").dispatchEvent("contextmenu");
@@ -252,19 +282,33 @@ try {
           const [tab] = await chrome.tabs.query({ url: "http://localhost:8788/*" });
           await chrome.tabs.sendMessage(tab.id, { type: "translate-image", srcUrl: s });
         }, await page.$eval("#im", (i) => i.currentSrc));
-        await page.waitForFunction(() => document.querySelector("plamo-translate-ui")?.shadowRoot?.querySelector(".img-ov")?.dataset.timing?.includes("total") || /없습니다|못했습니다/.test(document.querySelector("plamo-translate-ui")?.shadowRoot?.querySelector(".img-badge .label")?.textContent ?? ""), null, { timeout: 300_000, polling: 200 });
+        const finished = await page.waitForFunction(() => document.querySelector("plamo-translate-ui")?.shadowRoot?.querySelector(".img-ov")?.dataset.timing?.includes("total") || /없습니다|못했습니다/.test(document.querySelector("plamo-translate-ui")?.shadowRoot?.querySelector(".img-badge .label")?.textContent ?? ""), null, { timeout: 90_000, polling: 200 }).then(() => true, () => false);
+        // an overlay that never finishes is a failure of the build under test, not of the run
+        if (!finished) {
+          log("overlay did not finish:", item.id);
+          (summary.overlayFailed ??= []).push(item.id);
+          continue;
+        }
         const out = await page.evaluate(() => {
-          const ir = document.getElementById("im").getBoundingClientRect();
+          const im = document.getElementById("im");
+          const ir = im.getBoundingClientRect();
+          // everything in the image's own pixels (the page may show it smaller)
+          const k = im.naturalWidth / ir.width;
           return [...document.querySelector("plamo-translate-ui").shadowRoot.querySelectorAll(".img-para")].map((p) => {
             const span = p.querySelector("span");
             const range = document.createRange();
             range.selectNodeContents(span);
             const r = range.getBoundingClientRect();
-            return { box: [r.left - ir.left, r.top - ir.top, r.width, r.height], font: parseFloat(getComputedStyle(span).fontSize), src: p.title.split("\n")[0] };
+            const lines = new Set([...range.getClientRects()].map((c) => Math.round(c.top))).size;
+            return { box: [(r.left - ir.left) * k, (r.top - ir.top) * k, r.width * k, r.height * k], font: parseFloat(getComputedStyle(span).fontSize), lines, text: span.textContent, src: p.title.split("\n")[0], align: /align=(\w+)/.exec(p.dataset.style ?? "")?.[1], em: parseFloat(/em=([\d.]+)/.exec(p.dataset.style ?? "")?.[1] ?? "0"), ink: /ink=([\d.,-]+)/.exec(p.dataset.style ?? "")?.[1].split(",").map(Number) };
           });
         });
+        if (typo.length < shots) {
+          mkdirSync(join(HERE, "results", `shots-${tag}`), { recursive: true });
+          await page.locator("#im").screenshot({ path: join(HERE, "results", `shots-${tag}`, `${item.id}.png`) });
+        }
         // match each source run to the translated paragraph covering most of it
-        const matched = item.styles.map((s) => {
+        const matched = (item.styles ?? []).map((s) => {
           let best = null, bv = 0;
           for (const o of out) {
             const v = inter(s.box, o.box) / Math.max(1, area(s.box));
@@ -283,8 +327,30 @@ try {
           return Math.abs(at(m.o.box, m.s.align) - at(m.s.box, m.s.align)) / m.s.fontSize;
         });
         let collisions = 0;
-        for (let a = 0; a < out.length; a++) for (let b = a + 1; b < out.length; b++) if (inter(out[a].box, out[b].box) > 0.02 * Math.min(area(out[a].box), area(out[b].box))) collisions++;
-        typo.push({ id: item.id, matched: matched.length, runs: item.styles.length, sizeSpread: mean(spreads), anchorErr: mean(anchor), anchorP95: anchor.sort((a, b) => a - b)[Math.floor(anchor.length * 0.95)] ?? null, collisions });
+        const clashes = [];
+        for (let a = 0; a < out.length; a++) {
+          for (let b = a + 1; b < out.length; b++) {
+            if (inter(out[a].box, out[b].box) <= 0.02 * Math.min(area(out[a].box), area(out[b].box))) continue;
+            collisions++;
+            clashes.push([out[a].text.slice(0, 20), out[b].text.slice(0, 20)]);
+          }
+        }
+        // one translated paragraph per source run (a paragraph covering several runs says nothing about any one of them)
+        const single = matched.filter((m) => matched.filter((x) => x.o === m.o).length === 1);
+        // size against the source's: the translation's font size over the original's
+        const sizeRatio = single.map((m) => m.o.font / m.s.fontSize);
+        // the translation stays inside the image, and on as many lines as the original
+        const outside = out.filter((o) => o.box[0] < -1 || o.box[1] < -1 || o.box[0] + o.box[2] > item.width + 1 || o.box[1] + o.box[3] > item.height + 1).length;
+        const sameLines = single.filter((m) => m.o.lines === m.s.lines).length;
+        // its area against the original's: how much more (or less) of the design the text now takes
+        const areaRatio = single.map((m) => area(m.o.box) / Math.max(1, area(m.s.box)));
+        typo.push({
+          id: item.id, matched: matched.length, runs: (item.styles ?? []).length, paragraphs: out.length, shrunk: out.filter((o) => o.em && o.font / o.em < 0.6).length, texts: out.map((o) => ({ ink: o.ink, text: o.text })), regions: item.regions, words: out.reduce((a, o) => a + o.text.length, 0), sizeSpread: mean(spreads), anchorErr: mean(anchor),
+          anchorP95: anchor.sort((a, b) => a - b)[Math.floor(anchor.length * 0.95)] ?? null, collisions, sizeRatio, areaRatio, outside, sameLines, single: single.length,
+          detail: single.map((m) => ({ src: m.s.text.slice(0, 40), out: m.o.text.slice(0, 40), size: +(m.o.font / m.s.fontSize).toFixed(2), align: [m.s.align, m.o.align], lines: [m.s.lines, m.o.lines] })),
+          // pairs of colliding translations, for looking into them
+          clashes,
+        });
         await page.locator("#im").dispatchEvent("contextmenu");
       }
       await page.close();
@@ -294,14 +360,49 @@ try {
         anchorErrEm: mean(typo.map((t) => t.anchorErr).filter((x) => x != null)),
         anchorP95Em: mean(typo.map((t) => t.anchorP95).filter((x) => x != null)),
         collisions: typo.reduce((a, t) => a + t.collisions, 0),
+        // size fidelity: median translated/original font size, the share within ±15% of the original and below 70%
+        sizeRatio: median(typo.flatMap((t) => t.sizeRatio)),
+        sizeWithin15: share(typo.flatMap((t) => t.sizeRatio), (r) => r >= 0.85 && r <= 1.15),
+        sizeBelow70: share(typo.flatMap((t) => t.sizeRatio), (r) => r < 0.7),
+        // the same size to the eye: Hangul is as tall as a Latin capital at 0.87× the font size (image-view.ts), so a
+        // Latin source run translated into Korean is on target at 0.87; the share within ±15% of that
+        sizeOnTarget: share(typo.flatMap((t) => t.detail), (d) => {
+          const target = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(d.src) ? 1 : 0.87;
+          return d.size >= 0.85 * target && d.size <= 1.15 * target;
+        }),
+        areaRatio: median(typo.flatMap((t) => t.areaRatio)),
+        sameLines: +(typo.reduce((a, t) => a + t.sameLines, 0) / Math.max(1, typo.reduce((a, t) => a + t.single, 0))).toFixed(3),
+        // alignment read against the source's (start = left, end = right), over single runs
+        alignAcc: share(typo.flatMap((t) => t.detail), (d) => ({ start: "left", center: "center", end: "right" })[d.align[1]] === ({ justify: "left", start: "left", end: "right" }[d.align[0]] ?? d.align[0])),
+        outside: typo.reduce((a, t) => a + t.outside, 0),
+        paragraphs: typo.reduce((a, t) => a + t.paragraphs, 0),
       };
-      report.typography = typo;
+      // what needs no ground truth: translations running into each other, out of the image, or shrunk below 60% of
+      // the size read from the original
+      summary.overlay = { images: typo.length, paragraphs: typo.reduce((a, t) => a + t.paragraphs, 0), collisions: summary.typography.collisions, outside: summary.typography.outside, shrunk: typo.reduce((a, t) => a + t.shrunk, 0) };
+      if (!items[0]?.styles) delete summary.typography;
+      if (e2e) {
+        await sw.evaluate(() => chrome.storage.local.set({ targetLang: "ko" }));
+        // each reference bubble against the translations shown over it, in reading order (columns: right to left)
+        const pairs = [];
+        let shown = 0;
+        for (const t of typo) {
+          for (const g of t.regions.filter((g) => g.box && g.refs?.en)) {
+            const hits = t.texts.filter((o) => o.ink && inter(o.ink, g.box) > 0.5 * area(o.ink)).sort((a, b) => b.ink[0] - a.ink[0]);
+            if (hits.length) shown++;
+            pairs.push([hits.map((o) => o.text).join(" "), g.refs.en]);
+          }
+        }
+        summary.e2e = { bubbles: pairs.length, shown, chrF: chrF(pairs), chrFShown: chrF(pairs.filter((p) => p[0])) };
+      }
+      for (const t of typo) delete t.regions;
+      (report.typography ??= {})[set] = typo;
     }
     report.sets[set] = { summary, items: per };
     log(set, JSON.stringify(summary));
   }
   mkdirSync(join(HERE, "results"), { recursive: true });
-  const out = join(HERE, "results", `${report.date.replace(/[:.]/g, "-")}-${size}-ocr-${ocrModel}.json`);
+  const out = join(HERE, "results", `${report.date.replace(/[:.]/g, "-")}-${size}-ocr-${ocrModel}-${tag}.json`);
   writeFileSync(out, JSON.stringify(report, null, 1));
   log("report:", out);
 } finally {
